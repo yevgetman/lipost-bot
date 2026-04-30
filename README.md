@@ -50,11 +50,12 @@ chmod +x lipost-bot
 
 `init` is interactive. Every prompt has a sensible default — press enter to accept. It will:
 
-1. Run the dependency preflight.
+1. Run the dependency preflight (refuses to continue if `claude` or `lipost` is missing; pass `--force` to override).
 2. Write `~/.config/lipost-bot/config.json` with your settings (including `active=false`).
 3. Symlink `lipost-bot` into `~/.local/bin/`.
 4. Create `images/pending/`, `images/skipped/`, and `drafts/` under the repo.
-5. Generate `local.lipost-bot.plist`, symlink it into `~/Library/LaunchAgents/`, and load it.
+5. Seed `prompt.md` from `prompt.example.md` if `prompt.md` doesn't already exist (the TEMPLATE marker on line 1 stays in place — bot remains inert).
+6. Generate `local.lipost-bot.plist`, symlink it into `~/Library/LaunchAgents/`, and load it.
 
 After this, the schedule is **live but inert**. Two independent gates keep it from posting:
 
@@ -207,7 +208,7 @@ lipost-bot posts               # post history (URN + caption ref)
 | --- | --- |
 | Disarm the schedule (durable) | `lipost-bot config active false` |
 | Pause transiently for a few days | `lipost-bot pause` |
-| Drain the approved queue without posting | `lipost-bot drafts --status approved`, then for each: `# manually edit drafts/<slug>/meta.json status to "rejected"` (no built-in command — happy to add one if useful) |
+| Drain the approved queue without posting | Hand-edit `drafts/<slug>/meta.json` and change each `"status": "approved"` to `"rejected"`. The wrapper trusts what's on disk, so the change takes effect on the next `_cron`. Or `rm -rf drafts/<slug>` if you want them gone entirely. |
 | Take the bot off the schedule completely | `lipost-bot stop` |
 | Remove the install but keep config + drafts + history | `lipost-bot uninstall` |
 | Nuclear: remove everything | `lipost-bot uninstall && rm -rf ~/.config/lipost-bot ~/Library/Logs/lipost-bot.log ~/code/lipost-bot/{images,drafts}` |

@@ -314,6 +314,13 @@ def cmd_init(args: argparse.Namespace) -> None:
     (IMAGES_PENDING / ".gitkeep").touch()
     print(f"Drop images into {IMAGES_PENDING}/ — `lipost-bot generate` will drain them into drafts.")
 
+    # Seed prompt.md from the shipped example so first-run users have a working
+    # template to edit (with the TEMPLATE marker still in place — bot stays inert).
+    example_path = REPO_DIR / "prompt.example.md"
+    if example_path.exists() and not PROMPT_FILE.exists():
+        PROMPT_FILE.write_text(example_path.read_text())
+        print(f"Seeded {PROMPT_FILE} from prompt.example.md (template marker on line 1; remove it before going live).")
+
     # symlink binary onto PATH
     BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
     if BIN_LINK.is_symlink() or BIN_LINK.exists():
@@ -335,8 +342,13 @@ def cmd_init(args: argparse.Namespace) -> None:
     else:
         print(f"Loaded launchd job {LABEL} (baseline {cfg['baseline_hour']:02d}:00, jitter ≤ {jitter_h}h)")
 
-    if not PROMPT_FILE.exists() or PROMPT_FILE.stat().st_size == 0:
-        print(f"\nReminder: {PROMPT_FILE} is empty — bot will skip runs until you write instructions there.")
+    pstate = _prompt_state()
+    if pstate == "missing":
+        print(f"\nReminder: {PROMPT_FILE} is missing — `lipost-bot generate` will refuse to run until it exists.")
+    elif pstate == "empty":
+        print(f"\nReminder: {PROMPT_FILE} is empty — `lipost-bot generate` will refuse to run until you fill it.")
+    elif pstate == "template":
+        print(f"\nReminder: {PROMPT_FILE} still has the TEMPLATE marker — `lipost-bot generate` will refuse to run until you remove line 1.")
 
 
 def write_plist(cfg: dict) -> None:
@@ -1104,12 +1116,12 @@ def main() -> None:
     p_init.add_argument("--force", action="store_true", help="skip the lipost dependency check")
     p_init.set_defaults(func=cmd_init)
 
-    p_cfg = sub.add_parser("config", help="show or update settings (baseline_hour, jitter_max_secs, min_hours_between_runs, permission_mode)")
+    p_cfg = sub.add_parser("config", help="show or update settings (active, baseline_hour, jitter_max_secs, min_hours_between_runs, permission_mode, claude_model)")
     p_cfg.add_argument("key", nargs="?")
     p_cfg.add_argument("value", nargs="?")
     p_cfg.set_defaults(func=cmd_config)
 
-    sub.add_parser("status", help="show launchd / pause / last-run / next-window / posts-7d").set_defaults(func=cmd_status)
+    sub.add_parser("status", help="one-screen overview: active, deps, launchd, paused, last run, next window, posts last 7d, drafts queue, images pending").set_defaults(func=cmd_status)
     sub.add_parser("pause", help="skip runs without unloading launchd").set_defaults(func=cmd_pause)
     sub.add_parser("resume", help="undo pause").set_defaults(func=cmd_resume)
     sub.add_parser("start", help="load the launchd job").set_defaults(func=cmd_start)
