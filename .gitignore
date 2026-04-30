@@ -9,3 +9,7 @@ images/
 
 # logs
 *.log
+
+# macOS Finder noise
+.DS_Store
+**/.DS_Store
