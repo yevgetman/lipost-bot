@@ -796,6 +796,53 @@ def cmd_style(args: argparse.Namespace) -> None:
     subprocess.call([editor, str(USER_STYLE_FILE)])
 
 
+CHEATSHEET = """
+# ─── pulse check (use this most) ───────────────────────────────
+lipost-bot status              # everything in one screen
+
+# ─── content workflow ──────────────────────────────────────────
+lipost-bot images              # what's staged
+lipost-bot images --open       # open pending dir in Finder
+lipost-bot generate            # drain pending → drafts (Claude per image)
+lipost-bot review              # walk pending drafts: a/r/e/g/s/q
+lipost-bot drafts              # full queue grouped by status
+lipost-bot drafts --status approved   # what's queued to post
+
+# ─── posting ───────────────────────────────────────────────────
+lipost-bot run --no-fire       # show next post WITHOUT publishing
+lipost-bot run                 # post the next approved draft NOW
+lipost-bot posts               # what you've published (URN history)
+lipost-bot posts --open        # open most recent post on LinkedIn
+
+# ─── customization ─────────────────────────────────────────────
+lipost-bot prompt              # edit prompt.md (voice, content)
+lipost-bot style               # edit user_style.md (your formatting tweaks)
+lipost-bot style --show        # preview what Claude actually sees
+
+# ─── scheduling ────────────────────────────────────────────────
+lipost-bot next                # next scheduled fire window
+lipost-bot config active true|false           # arm/disarm post cron
+lipost-bot config generate_active true|false  # arm/disarm generate cron
+lipost-bot pause / resume      # transient pause without unloading launchd
+
+# ─── observability ─────────────────────────────────────────────
+lipost-bot logs -f             # tail what crons are doing right now
+lipost-bot logs -n 100         # last 100 lines
+
+# Daily flow:
+#   1. lipost-bot images --open  → drag images in
+#   2. (Wait for cron, or `lipost-bot generate` for instant)
+#   3. lipost-bot review         → approve/reject/edit/regenerate
+#   4. lipost-bot status         → confirm queue depth
+#
+# Full surface: lipost-bot --help
+"""
+
+
+def cmd_cheatsheet(args: argparse.Namespace) -> None:
+    print(CHEATSHEET.strip())
+
+
 def cmd_logs(args: argparse.Namespace) -> None:
     if not LOG_FILE.exists():
         print(f"no log file at {LOG_FILE}")
@@ -1390,6 +1437,7 @@ def main() -> None:
     p_cfg.set_defaults(func=cmd_config)
 
     sub.add_parser("status", help="one-screen overview: active, deps, launchd, paused, last run, next window, posts last 7d, drafts queue, images pending").set_defaults(func=cmd_status)
+    sub.add_parser("cheatsheet", help="print a curated list of the most common commands grouped by purpose").set_defaults(func=cmd_cheatsheet)
     sub.add_parser("pause", help="skip runs without unloading launchd").set_defaults(func=cmd_pause)
     sub.add_parser("resume", help="undo pause").set_defaults(func=cmd_resume)
     sub.add_parser("start", help="load the launchd job").set_defaults(func=cmd_start)

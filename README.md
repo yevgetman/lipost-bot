@@ -236,6 +236,14 @@ After step 9, the launch agent fires daily at `baseline_hour`, sleeps the jitter
 
 ## Day-to-day usage
 
+For the curated cheatsheet of just the commands you'll actually use day-to-day, run:
+
+```bash
+lipost-bot cheatsheet
+```
+
+The full surface, expanded:
+
 ```bash
 lipost-bot status              # everything in one screen
 lipost-bot drafts              # queue grouped by status
@@ -279,6 +287,7 @@ lipost-bot posts --open        # open the most recent post on LinkedIn
 | --- | --- |
 | `init [--force]` | Interactive setup. `--force` skips the dependency preflight. |
 | `status` | Single-screen overview: active (post cron) + gen-active (generate cron), deps OK?, both launchd jobs loaded?, paused?, last run, next window, posts in last 7d, drafts queue, images pending, full config. |
+| `cheatsheet` | Print a curated list of the most-used commands grouped by purpose (pulse / content / posting / customization / scheduling / observability). Quicker than scanning the full `--help`. |
 | `config` | Print all settings. |
 | `config <key>` | Print one key. |
 | `config <key> <value>` | Update one key (validated). Auto-reloads launchd if `baseline_hour` changes. |
