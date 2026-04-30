@@ -20,6 +20,8 @@ Three phases, each triggered separately:
 
 A min-hours-between-runs guard (default 20h) prevents accidental double-posting. A master `active` flag (default `false` after `init`) gates everything: scheduled fires skip until you set it to `true`.
 
+**Optional Phase 1 automation**. A second launchd job (`local.lipost-bot.generate`) periodically scans `images/pending/` and runs Phase 1 on anything new — gated by its own `generate_active` flag (default `false`) and configurable interval (default every 8 hours). Drop images into `pending/` whenever; come back hours later and `lipost-bot review` finds drafts already waiting. You can still run `lipost-bot generate` manually any time; both consume the same dir, so they don't double-process.
+
 ---
 
 ## Prerequisites
@@ -55,7 +57,7 @@ chmod +x lipost-bot
 3. Symlink `lipost-bot` into `~/.local/bin/`.
 4. Create `images/pending/`, `images/skipped/`, and `drafts/` under the repo.
 5. Seed `prompt.md` from `prompt.example.md` if `prompt.md` doesn't already exist (the TEMPLATE marker on line 1 stays in place — bot remains inert).
-6. Generate `local.lipost-bot.plist`, symlink it into `~/Library/LaunchAgents/`, and load it.
+6. Generate **two** plists (`local.lipost-bot.plist` for the post cron and `local.lipost-bot.generate.plist` for the optional auto-generate cron), symlink both into `~/Library/LaunchAgents/`, and load them. Both stay inert until you flip `active` and/or `generate_active` to `true`.
 
 After this, the schedule is **live but inert**. Two independent gates keep it from posting:
 
@@ -78,7 +80,9 @@ All settings live in `~/.config/lipost-bot/config.json`. Show with `lipost-bot c
 
 | Key | Default | What it controls |
 | --- | --- | --- |
-| `active` | `false` | Master arm switch. `init` writes `false` so the bot is inert by default. Manually flip to `true` once you have an approved queue. `lipost-bot run` ignores this; `_cron` honors it. |
+| `active` | `false` | Master arm switch for the **post** cron. `init` writes `false` so the bot is inert by default. Manually flip to `true` once you have an approved queue. `lipost-bot run` ignores this; `_cron` honors it. |
+| `generate_active` | `false` | Master arm switch for the **generate** cron (the one that auto-drains `images/pending/`). `init` writes `false`. Flip to `true` if you want unattended draft generation. The cron honors it; manual `lipost-bot generate` ignores it. |
+| `generate_interval_hours` | `8` | How often the generate cron fires (`StartInterval`). Editing this regenerates and reloads the launch agent. Min `1`. |
 | `baseline_hour` | `9` | Hour (0–23) at which `launchd` fires the bot, before jitter. |
 | `jitter_max_secs` | `43200` (12h) | Max seconds the wrapper sleeps after baseline before posting. Default gives a 09:00–21:00 run window. Set to `0` for a deterministic fire at exactly `baseline_hour:00`. |
 | `min_hours_between_runs` | `20` | If the previous run started less than this many hours ago, `_cron` skips. Prevents accidental double-posting. |
@@ -97,6 +101,12 @@ lipost-bot config jitter_max_secs 0
 
 # Use Sonnet during generate (faster, cheaper, weaker at images)
 lipost-bot config claude_model claude-sonnet-4-6
+
+# Turn on auto-generate cron (drains images/pending/ every 8h)
+lipost-bot config generate_active true
+
+# Run the auto-generate cron more frequently (every 4h)
+lipost-bot config generate_interval_hours 4
 ```
 
 ### Schedule mechanics
@@ -245,7 +255,8 @@ lipost-bot posts --open        # open the most recent post on LinkedIn
 
 | You want to… | Run |
 | --- | --- |
-| Disarm the schedule (durable) | `lipost-bot config active false` |
+| Disarm the post schedule (durable) | `lipost-bot config active false` |
+| Disarm the auto-generate cron | `lipost-bot config generate_active false` |
 | Pause transiently for a few days | `lipost-bot pause` |
 | Drain the approved queue without posting | Hand-edit `drafts/<slug>/meta.json` and change each `"status": "approved"` to `"rejected"`. The wrapper trusts what's on disk, so the change takes effect on the next `_cron`. Or `rm -rf drafts/<slug>` if you want them gone entirely. |
 | Take the bot off the schedule completely | `lipost-bot stop` |
@@ -269,7 +280,7 @@ lipost-bot posts --open        # open the most recent post on LinkedIn
 | `review` | TUI for pending drafts: prints image path + caption + alt in terminal, prompts `[a]pprove / [r]eject / [e]dit / [g]enerate-again / [s]kip / [q]uit`. `[e]` opens caption + alt in `$EDITOR`. `[g]` re-invokes Claude with optional feedback (e.g. "make it shorter") plus the previous draft as context, replaces the caption + alt in `meta.json`, and re-renders so you can review the rewrite. |
 | `drafts [--status STATUS] [--limit N]` | List drafts grouped by status (`pending_approval`, `approved`, `rejected`, `posted`). |
 | `pause` / `resume` | Set/clear `paused` in state. `_cron` skips while paused. |
-| `start` / `stop` | `launchctl load -w` / `unload` the plist. |
+| `start` / `stop` | `launchctl load -w` / `unload` **both** plists (post + generate). Idempotent. |
 | `run` | Post the next approved draft now, no jitter, ignoring `active`/`paused`/min-gap. Honors queue-empty (will skip if no approved drafts). |
 | `run --no-fire` | Print the resolved plan (queue counts, next draft, lipost path, deps, would-skip reasons) without calling lipost. |
 | `next` | Print the next scheduled window. |
@@ -299,9 +310,11 @@ lipost-bot posts --open        # open the most recent post on LinkedIn
 | `~/code/lipost-bot/drafts/<slug>/` | One directory per draft: `image.<ext>` + `meta.json` (status, caption, alt, timestamps, URN). |
 | `~/code/lipost-bot/style.md` | Baked-in formatting & punctuation layer (committed in repo, app-controlled). |
 | `~/code/lipost-bot/user_style.md` | Optional user additions to the style layer (gitignored). |
-| `~/code/lipost-bot/local.lipost-bot.plist` | Generated launch agent (gitignored). |
+| `~/code/lipost-bot/local.lipost-bot.plist` | Generated post-cron launch agent (gitignored). |
+| `~/code/lipost-bot/local.lipost-bot.generate.plist` | Generated auto-generate-cron launch agent (gitignored). |
 | `~/.local/bin/lipost-bot` | Symlink to the CLI for `PATH`. |
-| `~/Library/LaunchAgents/local.lipost-bot.plist` | Symlink to the repo plist. |
+| `~/Library/LaunchAgents/local.lipost-bot.plist` | Symlink to the post-cron plist. |
+| `~/Library/LaunchAgents/local.lipost-bot.generate.plist` | Symlink to the generate-cron plist. |
 
 ### Draft `meta.json` schema
 
@@ -336,6 +349,12 @@ lipost-bot config active false
 lipost-bot _cron        # logs "inactive (config.active=false) — skipping run"
 tail -3 ~/Library/Logs/lipost-bot.log
 lipost-bot config active true
+
+# 1b. Same for the generate cron — `generate` (manual) ignores it, so use `_cron_generate`:
+lipost-bot config generate_active false
+lipost-bot _cron_generate    # logs "[generate-cron] inactive ... — skipping"
+lipost-bot config generate_active true
+lipost-bot _cron_generate    # if pending/ has images, processes them; else logs "no images in pending"
 
 # 2. Pause path:
 lipost-bot pause

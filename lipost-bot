@@ -36,6 +36,14 @@ USER_STYLE_FILE = REPO_DIR / "user_style.md"
 LABEL = "local.lipost-bot"
 PLIST_SRC = REPO_DIR / f"{LABEL}.plist"
 PLIST_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+
+# Second launch agent: periodically scans images/pending/ and runs `generate`
+# on anything new. Independent enable flag (config.generate_active) and
+# interval (config.generate_interval_hours).
+GEN_LABEL = "local.lipost-bot.generate"
+GEN_PLIST_SRC = REPO_DIR / f"{GEN_LABEL}.plist"
+GEN_PLIST_DEST = HOME / "Library" / "LaunchAgents" / f"{GEN_LABEL}.plist"
+
 BIN_LINK = HOME / ".local" / "bin" / "lipost-bot"
 
 # Image staging — the user drops files into pending/. `lipost-bot generate`
@@ -58,12 +66,14 @@ LIPOST_CONFIG = HOME / ".config" / "linkedin-cli" / "config.json"
 LIPOST_TOKEN = HOME / ".config" / "linkedin-cli" / "token.json"
 
 DEFAULT_CONFIG = {
-    "active": False,                 # master arm switch; init writes False, user flips manually
+    "active": False,                 # master arm switch for the POST cron; init writes False
     "baseline_hour": 9,
     "jitter_max_secs": 43200,        # 12h → run window 09:00–21:00
     "min_hours_between_runs": 20,
     "permission_mode": "bypassPermissions",
     "claude_model": "claude-opus-4-7",
+    "generate_active": False,        # arm switch for the GENERATE cron; init writes False
+    "generate_interval_hours": 8,    # how often the generate cron checks pending/
 }
 
 # PATH for subprocesses launched by _cron (launchd env is minimal).
@@ -256,9 +266,9 @@ def check_dependencies() -> tuple[bool, list[str]]:
     return (not problems, problems)
 
 
-def launchctl_loaded() -> bool:
+def launchctl_loaded(label: str = LABEL) -> bool:
     r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
-    return any(line.split("\t")[-1] == LABEL for line in r.stdout.splitlines())
+    return any(line.split("\t")[-1] == label for line in r.stdout.splitlines())
 
 
 def parse_iso(s: str | None) -> datetime | None:
@@ -336,19 +346,29 @@ def cmd_init(args: argparse.Namespace) -> None:
     BIN_LINK.symlink_to(Path(__file__).resolve())
     print(f"Symlinked {BIN_LINK} → {Path(__file__).resolve()}")
 
-    # write/refresh plist with current baseline_hour and load it
+    # write/refresh plists with current config and load them
     write_plist(cfg)
+    write_generate_plist(cfg)
     PLIST_DEST.parent.mkdir(parents=True, exist_ok=True)
-    if PLIST_DEST.is_symlink() or PLIST_DEST.exists():
-        PLIST_DEST.unlink()
-    PLIST_DEST.symlink_to(PLIST_SRC)
+    for src, dst in ((PLIST_SRC, PLIST_DEST), (GEN_PLIST_SRC, GEN_PLIST_DEST)):
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+        dst.symlink_to(src)
 
     subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
     r = subprocess.run(["launchctl", "load", "-w", str(PLIST_DEST)], capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"launchctl load failed: {r.stderr}", file=sys.stderr)
+        print(f"launchctl load failed (post): {r.stderr}", file=sys.stderr)
     else:
-        print(f"Loaded launchd job {LABEL} (baseline {cfg['baseline_hour']:02d}:00, jitter ≤ {jitter_h}h)")
+        print(f"Loaded {LABEL} (POST cron — baseline {cfg['baseline_hour']:02d}:00, jitter ≤ {jitter_h}h)")
+
+    subprocess.run(["launchctl", "unload", str(GEN_PLIST_DEST)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", "-w", str(GEN_PLIST_DEST)], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"launchctl load failed (generate): {r.stderr}", file=sys.stderr)
+    else:
+        print(f"Loaded {GEN_LABEL} (GENERATE cron — every {cfg['generate_interval_hours']}h)")
+    print("\nNote: both crons are inert until you set `active=true` and/or `generate_active=true`.")
 
     pstate = _prompt_state()
     if pstate == "missing":
@@ -392,6 +412,35 @@ def write_plist(cfg: dict) -> None:
     PLIST_SRC.write_text(plist)
 
 
+def write_generate_plist(cfg: dict) -> None:
+    """Regenerate the generate-cron plist from config (so interval edits propagate)."""
+    program = str((REPO_DIR / "lipost-bot").resolve())
+    interval_secs = int(cfg.get("generate_interval_hours", 8)) * 3600
+    plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{GEN_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+        <string>_cron_generate</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>{interval_secs}</integer>
+    <key>StandardOutPath</key>
+    <string>{LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_FILE}</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+'''
+    GEN_PLIST_SRC.write_text(plist)
+
+
 def cmd_config(args: argparse.Namespace) -> None:
     cfg = get_config()
     if not args.key:
@@ -432,6 +481,9 @@ def cmd_config(args: argparse.Namespace) -> None:
     if args.key == "jitter_max_secs" and new_val < 0:
         print("jitter_max_secs must be ≥ 0", file=sys.stderr)
         sys.exit(1)
+    if args.key == "generate_interval_hours" and new_val < 1:
+        print("generate_interval_hours must be ≥ 1", file=sys.stderr)
+        sys.exit(1)
 
     cfg[args.key] = new_val
     save_json(CONFIG_FILE, cfg)
@@ -439,10 +491,16 @@ def cmd_config(args: argparse.Namespace) -> None:
 
     if args.key == "baseline_hour":
         write_plist(cfg)
-        if launchctl_loaded():
+        if launchctl_loaded(LABEL):
             subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
             subprocess.run(["launchctl", "load", "-w", str(PLIST_DEST)], capture_output=True)
-            print(f"reloaded launchd job (new baseline {new_val:02d}:00)")
+            print(f"reloaded post launchd job (new baseline {new_val:02d}:00)")
+    if args.key == "generate_interval_hours":
+        write_generate_plist(cfg)
+        if launchctl_loaded(GEN_LABEL):
+            subprocess.run(["launchctl", "unload", str(GEN_PLIST_DEST)], capture_output=True)
+            subprocess.run(["launchctl", "load", "-w", str(GEN_PLIST_DEST)], capture_output=True)
+            print(f"reloaded generate launchd job (new interval {new_val}h)")
 
 
 def cmd_status(args: argparse.Namespace) -> None:
@@ -459,9 +517,12 @@ def cmd_status(args: argparse.Namespace) -> None:
     deps_ok, deps_problems = check_dependencies()
 
     active = cfg.get("active", False)
-    print(f"  active:     {active}{'' if active else '  ← inert; activate with: lipost-bot config active true'}")
+    gen_active = cfg.get("generate_active", False)
+    gen_loaded = launchctl_loaded(GEN_LABEL)
+    print(f"  active:     {active}{'' if active else '  ← inert; activate with: lipost-bot config active true'}  (post cron)")
+    print(f"  gen-active: {gen_active}{'' if gen_active else '  ← off; turn on with: lipost-bot config generate_active true'}  (every {cfg.get('generate_interval_hours', 8)}h)")
     print(f"  deps:       {'OK' if deps_ok else 'BROKEN — see problems below'}")
-    print(f"  launchd:    {'loaded' if loaded else 'NOT loaded (run: lipost-bot start)'}")
+    print(f"  launchd:    post={'loaded' if loaded else 'NOT loaded'}, gen={'loaded' if gen_loaded else 'NOT loaded'}")
     print(f"  paused:     {state.get('paused', False)}")
     print(f"  last run:   {last_str}{last_ago_str}")
     print(f"  posts (7d): {posts_7d}")
@@ -562,22 +623,29 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
 
 def cmd_start(args: argparse.Namespace) -> None:
-    if launchctl_loaded():
-        print("already loaded.")
-        return
-    r = subprocess.run(["launchctl", "load", "-w", str(PLIST_DEST)], capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"failed: {r.stderr}", file=sys.stderr)
-        sys.exit(1)
-    print(f"loaded {LABEL}")
+    """Load both launchd jobs (post + generate). Idempotent."""
+    for lbl, dst in ((LABEL, PLIST_DEST), (GEN_LABEL, GEN_PLIST_DEST)):
+        if launchctl_loaded(lbl):
+            print(f"{lbl}: already loaded")
+            continue
+        if not dst.exists():
+            print(f"{lbl}: plist symlink missing at {dst} (re-run `lipost-bot init`)", file=sys.stderr)
+            continue
+        r = subprocess.run(["launchctl", "load", "-w", str(dst)], capture_output=True, text=True)
+        if r.returncode != 0:
+            print(f"{lbl}: failed — {r.stderr}", file=sys.stderr)
+        else:
+            print(f"{lbl}: loaded")
 
 
 def cmd_stop(args: argparse.Namespace) -> None:
-    if not launchctl_loaded():
-        print("not loaded.")
-        return
-    subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
-    print(f"unloaded {LABEL}")
+    """Unload both launchd jobs (post + generate)."""
+    for lbl, dst in ((LABEL, PLIST_DEST), (GEN_LABEL, GEN_PLIST_DEST)):
+        if not launchctl_loaded(lbl):
+            print(f"{lbl}: not loaded")
+            continue
+        subprocess.run(["launchctl", "unload", str(dst)], capture_output=True)
+        print(f"{lbl}: unloaded")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -1104,12 +1172,13 @@ def cmd_drafts(args: argparse.Namespace) -> None:
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
-    if launchctl_loaded():
-        subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
-        print(f"unloaded {LABEL}")
-    if PLIST_DEST.is_symlink() or PLIST_DEST.exists():
-        PLIST_DEST.unlink()
-        print(f"removed {PLIST_DEST}")
+    for lbl, dst in ((LABEL, PLIST_DEST), (GEN_LABEL, GEN_PLIST_DEST)):
+        if launchctl_loaded(lbl):
+            subprocess.run(["launchctl", "unload", str(dst)], capture_output=True)
+            print(f"unloaded {lbl}")
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+            print(f"removed {dst}")
     if BIN_LINK.is_symlink():
         BIN_LINK.unlink()
         print(f"removed {BIN_LINK}")
@@ -1120,6 +1189,74 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
 
 def cmd_cron(args: argparse.Namespace) -> None:
     _do_post_run(force=False)
+
+
+def cmd_cron_generate(args: argparse.Namespace) -> None:
+    _do_generate_cron()
+
+
+def _do_generate_cron() -> None:
+    """Background scan: drain images/pending/ into pending_approval drafts.
+    Honors generate_active flag. No-op when nothing's pending or anything
+    upstream is missing — logs each skip reason."""
+    cfg = get_config()
+
+    if not cfg.get("generate_active", False):
+        log("[generate-cron] inactive (config.generate_active=false) — skipping")
+        return
+
+    ok, problems = check_dependencies()
+    if not ok:
+        for p in problems:
+            log(f"[generate-cron] dependency check failed: {p}")
+        log("[generate-cron] skipping (run `lipost-bot status` for details)")
+        return
+
+    pstate = _prompt_state()
+    if pstate != "ready":
+        log(f"[generate-cron] prompt not ready ({pstate}) — skipping")
+        return
+
+    pending = list_pending_images()
+    if not pending:
+        log("[generate-cron] no images in pending — skipping")
+        return
+
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"[generate-cron] processing {len(pending)} image(s) using {cfg['claude_model']}")
+
+    saved = skipped = failed = 0
+    for img in pending:
+        try:
+            parsed, info = _invoke_claude_on_image(img, cfg)
+        except KeyboardInterrupt:
+            log("[generate-cron] aborted by signal")
+            return
+
+        if parsed is None:
+            log(f"[generate-cron] {img.name}: ✗ {info}")
+            failed += 1
+            continue
+
+        if parsed.get("skip"):
+            reason = parsed.get("reason", "(no reason given)")
+            park_skipped_image(img, reason)
+            log(f"[generate-cron] {img.name}: SKIP — {reason}")
+            skipped += 1
+            continue
+
+        caption = (parsed.get("caption") or "").strip()
+        alt = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+        if not caption:
+            log(f"[generate-cron] {img.name}: ✗ JSON had no caption")
+            failed += 1
+            continue
+
+        slug = create_draft(img, caption, alt, cfg["claude_model"])
+        log(f"[generate-cron] {img.name}: ✓ draft {slug}")
+        saved += 1
+
+    log(f"[generate-cron] done. saved={saved}, skipped={skipped}, failed={failed}")
 
 
 def _next_approved_draft() -> dict | None:
@@ -1294,6 +1431,9 @@ def main() -> None:
 
     p_cron = sub.add_parser("_cron", help=argparse.SUPPRESS)
     p_cron.set_defaults(func=cmd_cron)
+
+    p_cron_gen = sub.add_parser("_cron_generate", help=argparse.SUPPRESS)
+    p_cron_gen.set_defaults(func=cmd_cron_generate)
 
     args = p.parse_args()
     args.func(args)
