@@ -1,24 +1,24 @@
 # lipost-bot
 
-A tiny launchd-driven autonomous LinkedIn poster. Once a day, at a randomized human-ish time, it fires up Claude Code, lets Claude look at one of your staged images (optional), write a caption, and publish to your LinkedIn feed via [`lipost`](https://github.com/yevgetman/lipost).
+A tiny launchd-driven autonomous LinkedIn poster with a human-in-the-loop approval queue. You batch-generate captioned drafts from staged images, review them in a TUI, approve the ones you like — and the bot posts the approved queue, one per day, at a randomized human-ish time.
 
 - macOS only (uses `launchd`).
 - Single-file Python 3 CLI, stdlib only — no `pip install`.
-- All scheduling, pause/resume, history, and config via `lipost-bot <command>`.
+- All commands via `lipost-bot <subcommand>`.
 
 ---
 
 ## How it works
 
-1. `launchd` fires at a fixed **baseline hour** every day (default `09:00`).
-2. The bot sleeps a random `0…N` seconds (default `0…12h`) — so the actual post lands somewhere inside a window (e.g. 09:00–21:00) at a different time each day.
-3. The bot reads `prompt.md`. If it contains `{{IMAGE_PATH}}`, the bot picks a random image from `images/pending/` and substitutes the absolute path.
-4. The bot runs `claude -p "<prompt>" --permission-mode bypassPermissions --model claude-opus-4-7` inside the repo dir.
-5. Claude follows your prompt — typically: read the image, write a caption, call `lipost post --image <path> --alt "<alt>" "<caption>"`.
-6. The bot scrapes the `urn:li:share:…` from Claude's output, appends it to `posts.jsonl`, and (if image mode) moves the image to `images/used/<timestamp>_<filename>` so it's never reused.
-7. Min-hours-between-runs guard (default 20h) prevents accidental double-posting on the same day.
+Three phases, each triggered separately:
 
-A master `active` switch (default `false` after install) gates everything: until you set it to `true`, every scheduled fire skips. `lipost-bot run` for manual testing ignores this gate so you can verify end-to-end before arming.
+**Phase 1 — Generate** (`lipost-bot generate`, manual). Drains everything in `images/pending/`. For each image, runs Claude Code with your `prompt.md`. Claude reads the image and outputs a JSON object with a caption + alt text. Each `(image, caption, alt)` is saved as a draft directory under `drafts/<slug>/` with status `pending_approval`. Images Claude SKIPs are moved to `images/skipped/` with the reason recorded.
+
+**Phase 2 — Review** (`lipost-bot review`, manual). Walks pending drafts. For each one: opens the image in Preview.app, displays caption + alt in the terminal, prompts `[a]pprove / [r]eject / [e]dit / [s]kip / [q]uit`. `e` opens caption + alt in `$EDITOR` for revision. Approved drafts move to status `approved` and join the posting queue.
+
+**Phase 3 — Post** (launchd, automatic; or `lipost-bot run`, manual). When `launchd` fires at the daily `baseline_hour`, the wrapper sleeps a random `0…N` seconds (jitter), then picks the **oldest approved draft** and runs `lipost post --image <path> --alt "<alt>" "<caption>"`. On success, the draft's status flips to `posted` and the URN is recorded. **No Claude at fire time** — the LLM work happened during Phase 1.
+
+A min-hours-between-runs guard (default 20h) prevents accidental double-posting. A master `active` flag (default `false` after `init`) gates everything: scheduled fires skip until you set it to `true`.
 
 ---
 
@@ -26,13 +26,13 @@ A master `active` switch (default `false` after install) gates everything: until
 
 | Dependency | Why | Verify |
 | --- | --- | --- |
-| **Claude Code CLI** as `claude` on `PATH` | Generates the post text. | `claude --version` |
-| **lipost CLI** as `lipost` on `PATH` | Publishes the post to LinkedIn. | `lipost --help` |
+| **Claude Code CLI** as `claude` on `PATH` | Generates captions during Phase 1. Not needed at fire time. | `claude --version` |
+| **lipost CLI** as `lipost` on `PATH` | Publishes posts during Phase 3. | `lipost --help` |
 | `~/.config/linkedin-cli/config.json` | LinkedIn client id/secret. Created by `lipost init`. | `ls ~/.config/linkedin-cli/config.json` |
 | `~/.config/linkedin-cli/token.json` | LinkedIn OAuth token. Created by `lipost auth`. Lasts ~60 days. | `lipost whoami` should print your URN |
 | macOS with `~/.local/bin` on `PATH` and `~/Library/LaunchAgents/` writable | Where the symlink and launch agent go. | `echo $PATH \| grep .local/bin` |
 
-If any of these are missing, `lipost-bot init` will refuse to set up and tell you which one. (Pass `--force` to override.) The same check runs inside every scheduled run, so a missing dependency causes a skip with a clear log line — never a confusing failure deep inside Claude.
+`lipost-bot init` runs a preflight check covering `claude`, `lipost`, and the `lipost` config + token files; refuses to set up if anything is missing. The same check runs inside every scheduled run, so a missing dependency causes a skip with a clear log line. `lipost-bot status` shows current state under `deps:`. Pass `--force` to `init` to override.
 
 Install Claude Code: <https://docs.claude.com/en/docs/claude-code>
 Install lipost: <https://github.com/yevgetman/lipost>
@@ -50,18 +50,16 @@ chmod +x lipost-bot
 
 `init` is interactive. Every prompt has a sensible default — press enter to accept. It will:
 
-1. Run the dependency preflight (above).
-2. Write `~/.config/lipost-bot/config.json` with your settings.
-3. Symlink `lipost-bot` into `~/.local/bin/` so the command is on your `PATH`.
-4. Create `images/pending/` and `images/used/` under the repo for image staging.
-5. Generate `local.lipost-bot.plist`, symlink it into `~/Library/LaunchAgents/`, and `launchctl load -w` it.
+1. Run the dependency preflight.
+2. Write `~/.config/lipost-bot/config.json` with your settings (including `active=false`).
+3. Symlink `lipost-bot` into `~/.local/bin/`.
+4. Create `images/pending/`, `images/skipped/`, and `drafts/` under the repo.
+5. Generate `local.lipost-bot.plist`, symlink it into `~/Library/LaunchAgents/`, and load it.
 
-After this, the schedule is **live but inert**. The bot is loaded into `launchd`, but two independent gates keep it from posting:
+After this, the schedule is **live but inert**. Two independent gates keep it from posting:
 
-1. **`active=false`** in `config.json` — the master arm switch. `init` always writes `false`. The bot will not run until you explicitly flip it to `true`. (`lipost-bot run` for manual testing ignores this; `_cron` honors it.)
-2. **The `<!-- TEMPLATE: … -->` marker** on line 1 of `prompt.md` — until you delete it, every run skips with `prompt is still the template`.
-
-Both must be cleared before the bot will publish anything autonomously.
+1. **`active=false`** in `config.json` — master arm switch. The bot will not post on schedule until flipped to `true`.
+2. **The `<!-- TEMPLATE: … -->` marker** on line 1 of `prompt.md` — until you delete it, `generate` refuses to run.
 
 Verify with:
 
@@ -69,28 +67,22 @@ Verify with:
 lipost-bot status
 ```
 
-You should see `active: False ← inert`, `deps: OK`, `launchd: loaded`, and `prompt: template — edit before going live (will skip)`.
+You should see `active: False ← inert`, `deps: OK`, `launchd: loaded`, `prompt: template`, and `drafts: approved=0, pending=0, …`.
 
 ---
 
 ## Step 2 — Configure
 
-All settings live in `~/.config/lipost-bot/config.json`. View them with:
-
-```bash
-lipost-bot config
-```
-
-Update one with `lipost-bot config <key> <value>` (validated and cast to the right type). Changing `baseline_hour` automatically regenerates the plist and reloads `launchd`.
+All settings live in `~/.config/lipost-bot/config.json`. Show with `lipost-bot config`. Update with `lipost-bot config <key> <value>` (validated and cast to the right type). Changing `baseline_hour` automatically regenerates the plist and reloads `launchd`.
 
 | Key | Default | What it controls |
 | --- | --- | --- |
-| `active` | `false` | Master arm switch. `init` writes `false` so the bot is **inert by default after install** — every scheduled fire skips with `inactive (config.active=false) — skipping run`. Manually flip to `true` only after you've reviewed the prompt and staged any images. `lipost-bot run` ignores this (so testing is unaffected); `_cron` honors it. |
+| `active` | `false` | Master arm switch. `init` writes `false` so the bot is inert by default. Manually flip to `true` once you have an approved queue. `lipost-bot run` ignores this; `_cron` honors it. |
 | `baseline_hour` | `9` | Hour (0–23) at which `launchd` fires the bot, before jitter. |
-| `jitter_max_secs` | `43200` (12h) | Max seconds the wrapper sleeps after baseline before invoking Claude. Default gives a 09:00–21:00 run window. Set to `0` for a deterministic fire at exactly `baseline_hour:00`. |
+| `jitter_max_secs` | `43200` (12h) | Max seconds the wrapper sleeps after baseline before posting. Default gives a 09:00–21:00 run window. Set to `0` for a deterministic fire at exactly `baseline_hour:00`. |
 | `min_hours_between_runs` | `20` | If the previous run started less than this many hours ago, `_cron` skips. Prevents accidental double-posting. |
-| `permission_mode` | `bypassPermissions` | Passed to `claude -p` as `--permission-mode`. The bot is unattended, so it must not stop on permission prompts. |
-| `claude_model` | `claude-opus-4-7` | Passed to `claude -p` as `--model`. Use a full model id (`claude-opus-4-7`, `claude-sonnet-4-6`) or an alias (`opus`, `sonnet`). Default is Opus 4.7 because image interpretation benefits from the strongest model. |
+| `permission_mode` | `bypassPermissions` | Passed to `claude -p` during `generate` as `--permission-mode`. |
+| `claude_model` | `claude-opus-4-7` | Passed to `claude -p` during `generate` as `--model`. Use a full id (`claude-opus-4-7`, `claude-sonnet-4-6`) or alias (`opus`, `sonnet`). Default is Opus 4.7 because image interpretation benefits from the strongest model. |
 
 ### Common config recipes
 
@@ -102,106 +94,96 @@ lipost-bot config jitter_max_secs 21600
 # Post at exactly 09:00 every day (no jitter)
 lipost-bot config jitter_max_secs 0
 
-# Use Sonnet instead of Opus (faster, cheaper, weaker at image reading)
+# Use Sonnet during generate (faster, cheaper, weaker at images)
 lipost-bot config claude_model claude-sonnet-4-6
-
-# Allow two posts per day if you're feeling chatty
-lipost-bot config min_hours_between_runs 10
 ```
 
 ### Schedule mechanics
 
-`launchd` doesn't have native jitter. The trick: it fires at a fixed `baseline_hour` daily, and the wrapper sleeps a uniform random `0…jitter_max_secs` before invoking Claude. So the actual post drifts inside `[baseline, baseline + jitter_max_secs]` each day.
-
-`lipost-bot next` prints the next scheduled window (e.g. `2026-05-01 09:00 – 21:00 (window 12h)`).
+`launchd` doesn't have native jitter. The trick: `launchd` fires at `baseline_hour` daily, and the wrapper sleeps a uniform random `0…jitter_max_secs` before posting. So the actual post drifts inside a window each day. `lipost-bot next` prints the next window.
 
 ---
 
 ## Step 3 — Write the prompt
 
-The bot is intentionally dumb. *All policy lives in `prompt.md`.* Open it:
+The prompt is consumed only at **generate time**, not at fire time. It tells Claude how to read an image and what JSON to output.
 
 ```bash
 lipost-bot prompt          # opens prompt.md in $EDITOR
 ```
 
-You'll see a working starter template (copied from `prompt.example.md`) with two important things on it:
+The shipped `prompt.md` already has a working starter. Two important things on it:
 
-1. **Line 1 is a `<!-- TEMPLATE: … -->` marker.** While that line is present, the bot refuses to run. It's an explicit "I'm not ready yet" gate. **Delete the line when you're ready to go live.**
-2. **The body uses image mode** (it includes `{{IMAGE_PATH}}`). Read the next subsection for what that means; if you want text-only posts, just remove the placeholder and the image-related instructions.
+1. **Line 1 is a `<!-- TEMPLATE: … -->` marker.** While that line is present, `generate` refuses to run. **Delete it once you've customized the body below.**
+2. **The body uses image mode** (it includes `{{IMAGE_PATH}}`). The wrapper substitutes that with an absolute path at run time.
 
-### Image-mode prompts (default)
+### What the prompt must produce
 
-When `prompt.md` contains the placeholder `{{IMAGE_PATH}}`:
-- The bot picks a random file from `~/code/lipost-bot/images/pending/` and substitutes its absolute path into the prompt at run time.
-- Claude reads the image (the Read tool accepts image files), writes a caption from it, and runs `lipost post --image "<path>" --alt "<alt>" "<caption>"`.
-- After a successful post, the image is moved to `images/used/<YYYYMMDDTHHMMSS>_<filename>` so it's never reused.
-- If the placeholder is present but `images/pending/` is empty, the run is skipped with `prompt requires {{IMAGE_PATH}} but ... is empty`.
+The wrapper parses Claude's stdout for a single JSON object. **The prompt must instruct Claude to output JSON only, no preamble, no code fence.** Two shapes are accepted:
 
-Drop your staged JPEG, PNG, or GIF files into `~/code/lipost-bot/images/pending/`. List with `lipost-bot images`. Animated GIFs upload as-is and generally animate in LinkedIn's feed renderer; Claude only sees a representative frame when reading the file, so the example prompt instructs it to caption the image without assuming a still scene.
-
-### Text-only prompts
-
-If you don't want image mode, just don't use the placeholder. The bot ignores `images/` entirely. A minimal text-only prompt:
-
-```
-You are the autonomous voice of <name> on LinkedIn. On each run, publish exactly one post (1–3 sentences) about something you find interesting in software/AI today. Use `lipost post "<text>"`. Output only the URN it prints. No hashtags, no "excited to share", no LinkedIn cliches.
+```json
+{"caption": "<post body>", "alt": "<one-line factual description>"}
 ```
 
-### Things every prompt should include
+```json
+{"skip": true, "reason": "<short explanation>"}
+```
 
-- **Tell Claude to actually post.** `lipost post "<text>"` (or `lipost post --image …` for image mode). Without an explicit call, Claude will write a draft and exit.
-- **Tell Claude to output ONLY the URN** (or the literal string `SKIP`). Anything else clutters the log.
-- **Tell Claude not to use `--dry-run`.** It's useful for testing but you'll never publish if Claude defaults to it.
-- **Tone, topic, length, hashtags, emojis** — all explicit. Claude defaults to LinkedIn-cliché slop without instruction.
-- **A `SKIP` clause.** "If you'd be repeating yourself or have nothing meaningful, output `SKIP`." Gives the bot a non-posting fallback.
+If parsing fails (no valid JSON in the output), `generate` logs the failure for that image and leaves it in `pending/` for retry.
 
-The bot can't see prior posts on its own. The URN list in `~/.config/lipost-bot/posts.jsonl` is recorded but isn't injected into the prompt unless you explicitly write logic to do so.
+### What every prompt should include
+
+- The `{{IMAGE_PATH}}` placeholder (substituted at run time).
+- An instruction to **read the image** (Claude's Read tool accepts JPEG/PNG/GIF; for GIFs it sees a representative frame).
+- A `SKIP` clause: tell Claude what conditions warrant `{"skip": true, ...}` — image off-domain, ambiguous, repetitive.
+- Tone, topic, length, hashtag, emoji constraints — explicit. Claude defaults to LinkedIn-cliché slop without them.
+- Banned phrases ("excited to share", "thrilled to announce", "what are your thoughts?", etc).
+- An explicit instruction to **output ONLY the JSON** — no explanation, no code fence.
+
+The shipped `prompt.example.md` is a generic starter; `prompt.md` is the live file. They have the same shape.
 
 ---
 
-## Step 4 — Verify and go live
+## Step 4 — Stage, generate, review, arm
 
 ```bash
-# 1. Inspect what would happen — no LinkedIn call
-lipost-bot run --no-fire
-```
+# 1. Stage one or more images
+cp ~/Pictures/diagram.png ~/code/lipost-bot/images/pending/
+# Or open the dir in Finder and drag them in:
+lipost-bot images --open
 
-Prints cwd, resolved `claude` and `lipost` paths, the launchd-context PATH, prompt body, image mode (on/off + which image would be picked), the exact command that would run, and any unmet dependencies. Useful for catching shell-PATH vs launchd-PATH mismatches.
+# 2. Confirm they're picked up
+lipost-bot images
 
-```bash
-# 2. Real run, no jitter, ignores active/paused/min-gap guards
+# 3. Edit the prompt — and DELETE the TEMPLATE marker on line 1 when ready
+lipost-bot prompt
+
+# 4. Drain the pending dir into drafts (this calls Claude once per image)
+lipost-bot generate
+
+# 5. Review each draft in the TUI
+lipost-bot review
+# For each: image opens in Preview, caption + alt show in terminal.
+# Press a/r/e/s/q. `e` opens caption+alt in $EDITOR.
+
+# 6. Verify state — `drafts: approved=N` should be > 0
+lipost-bot status
+lipost-bot drafts --status approved
+
+# 7. Sanity-check what the bot would do at fire time
+lipost-bot run --no-fire    # shows queue + next draft + lipost path
+
+# 8. Test-post the next approved draft NOW
 lipost-bot run
-```
+lipost-bot posts --open     # see it on LinkedIn
+lipost delete <urn>         # if you want it gone
 
-Watch the log:
-
-```bash
-lipost-bot logs -f
-```
-
-When Claude exits, check that the URN was recorded:
-
-```bash
-lipost-bot posts                # URN + which image was used
-lipost-bot posts --open         # opens it on LinkedIn in your browser
-lipost-bot images               # confirm the image moved to used/
-```
-
-If you don't want the test post live, delete it:
-
-```bash
-lipost delete <urn>
-```
-
-When you're confident, **arm the bot** so the daily schedule actually publishes:
-
-```bash
+# 9. Arm the schedule
 lipost-bot config active true
-lipost-bot status                 # confirm: active: True
+lipost-bot status           # active: True
 ```
 
-Until you flip `active` to `true`, the launch agent will fire on schedule but every run will skip. After arming, the launch agent fires daily at `baseline_hour` and Claude does the rest. `lipost-bot status` is the one-stop check.
+After step 9, the launch agent fires daily at `baseline_hour`, sleeps the jitter, and pops the next approved draft. `lipost-bot status` is the one-stop check at any time.
 
 ---
 
@@ -209,30 +191,28 @@ Until you flip `active` to `true`, the launch agent will fire on schedule but ev
 
 ```bash
 lipost-bot status              # everything in one screen
-lipost-bot pause               # skip future runs without unloading launchd
-lipost-bot resume              # undo pause
-lipost-bot stop                # off the schedule entirely
-lipost-bot start               # back on the schedule
-lipost-bot images              # what's staged, what's been posted
-lipost-bot posts               # post history
-lipost-bot logs -f             # tail what's happening
+lipost-bot drafts              # queue grouped by status
+lipost-bot drafts --status approved   # just the queue waiting to post
+lipost-bot generate            # whenever you've staged new images
+lipost-bot review              # whenever there are pending drafts
+lipost-bot pause / resume      # transient pause without unloading launchd
+lipost-bot stop / start        # off / on the schedule
+lipost-bot logs -f             # tail live activity
+lipost-bot posts               # post history (URN + caption ref)
 ```
 
 ### Kill switches (in order of severity)
 
 | You want to… | Run |
 | --- | --- |
-| Disarm — bot stays loaded but won't publish on schedule | `lipost-bot config active false` (durable, persists across reboots) |
-| Pause transiently for a few days, easy resume | `lipost-bot pause` |
-| Stop posting *right now* without commands | `: > prompt.md` (truncate to zero bytes — `_cron` skips) |
-| Take it off the schedule completely | `lipost-bot stop` |
-| Remove the install but keep config + history | `lipost-bot uninstall` |
-| Nuclear: remove everything | `lipost-bot uninstall && rm -rf ~/.config/lipost-bot ~/Library/Logs/lipost-bot.log ~/code/lipost-bot/images` |
+| Disarm the schedule (durable) | `lipost-bot config active false` |
+| Pause transiently for a few days | `lipost-bot pause` |
+| Drain the approved queue without posting | `lipost-bot drafts --status approved`, then for each: `# manually edit drafts/<slug>/meta.json status to "rejected"` (no built-in command — happy to add one if useful) |
+| Take the bot off the schedule completely | `lipost-bot stop` |
+| Remove the install but keep config + drafts + history | `lipost-bot uninstall` |
+| Nuclear: remove everything | `lipost-bot uninstall && rm -rf ~/.config/lipost-bot ~/Library/Logs/lipost-bot.log ~/code/lipost-bot/{images,drafts}` |
 
-**`active` vs `paused` vs `stop`:** all three prevent posts, but they're at different layers and feel different.
-- `active=false` is the master switch in `config.json`. Use it for "I'm not ready for this to be running yet" or "take it offline indefinitely." Doesn't touch launchd.
-- `paused=true` is in `state.json`. Use it for short tactical pauses (vacation, conference week). Same effect, but a different verb makes the intent clearer in your shell history.
-- `stop` unloads the launch agent entirely. Use it when you want the bot off the system, not just dormant.
+**`active` vs `paused` vs `stop`**: all three prevent posts at different layers. `active` is the durable master switch in config. `paused` is a transient flag in state. `stop` unloads the launch agent entirely.
 
 ---
 
@@ -241,94 +221,108 @@ lipost-bot logs -f             # tail what's happening
 | Command | What it does |
 | --- | --- |
 | `init [--force]` | Interactive setup. `--force` skips the dependency preflight. |
-| `status` | Single-screen overview: active?, deps OK?, launchd loaded?, paused?, last run, next window, posts in last 7d, images pending, full config. |
+| `status` | Single-screen overview: active?, deps OK?, launchd loaded?, paused?, last run, next window, posts in last 7d, drafts queue, images pending, full config. |
 | `config` | Print all settings. |
 | `config <key>` | Print one key. |
 | `config <key> <value>` | Update one key (validated). Auto-reloads launchd if `baseline_hour` changes. |
-| `pause` | Set `paused: true`. `_cron` skips runs while paused. Survives reboot. |
-| `resume` | Clear `paused`. |
-| `start` | `launchctl load -w` the plist. |
-| `stop` | `launchctl unload` the plist. The bot is fully off the schedule. |
-| `run` | Fire `_cron` immediately, no jitter, ignoring `active` + `paused` + min-gap guards. For testing — works even when the bot is disarmed. |
-| `run --no-fire` | Print the resolved plan (cwd, claude/lipost paths, PATH, prompt, image mode, full command, deps) without invoking Claude. |
+| `generate` | Drain `images/pending/`. Calls Claude per image. Saves drafts as `pending_approval`. Skipped images go to `images/skipped/` with a reason sidecar. |
+| `review` | TUI for pending drafts: image opens in Preview, caption + alt in terminal, prompts `[a]pprove / [r]eject / [e]dit / [s]kip / [q]uit`. |
+| `drafts [--status STATUS] [--limit N]` | List drafts grouped by status (`pending_approval`, `approved`, `rejected`, `posted`). |
+| `pause` / `resume` | Set/clear `paused` in state. `_cron` skips while paused. |
+| `start` / `stop` | `launchctl load -w` / `unload` the plist. |
+| `run` | Post the next approved draft now, no jitter, ignoring `active`/`paused`/min-gap. Honors queue-empty (will skip if no approved drafts). |
+| `run --no-fire` | Print the resolved plan (queue counts, next draft, lipost path, deps, would-skip reasons) without calling lipost. |
 | `next` | Print the next scheduled window. |
-| `prompt` | Open `prompt.md` in `$EDITOR` (defaults to `vi`). |
-| `posts [--limit N]` | List recorded URNs, newest first. |
-| `posts --open` | Open the most recent recorded post in your browser. |
-| `images` | List `images/pending/` and recent `images/used/` contents. |
-| `images --open` | Open `images/pending/` in Finder (so you can drag images in). Add `--used` to open the archive instead. |
-| `logs [-n N] [-f]` | Tail the log. `-f` follows. |
-| `uninstall` | Unload launchd, remove plist + PATH symlinks. **Keeps** `~/.config/lipost-bot/` (config + history). |
+| `prompt` | Open `prompt.md` in `$EDITOR`. |
+| `posts [--limit N] [--open]` | Post history. `--open` opens the most recent URN in browser. |
+| `images [--open] [--skipped]` | List `images/pending/` (and `images/skipped/` if any). `--open` opens pending in Finder; `--skipped` opens the skipped dir. |
+| `logs [-n N] [-f]` | Tail `~/Library/Logs/lipost-bot.log`. `-f` follows. |
+| `uninstall` | Unload launchd, remove plist + PATH symlinks. **Keeps** `~/.config/lipost-bot/`, `drafts/`, and `images/`. |
 
 `lipost-bot _cron` is the internal entry point launchd calls. You don't normally run it by hand, but it's useful for testing the `active` / `paused` / min-gap paths (`run` ignores all three; `_cron` honors them all).
 
 ---
 
-## Files this CLI writes
+## Files
 
 | Path | Purpose |
 | --- | --- |
 | `~/.config/lipost-bot/config.json` | Settings (chmod 600). |
-| `~/.config/lipost-bot/state.json` | `last_run_at` and `paused` (chmod 600). |
-| `~/.config/lipost-bot/posts.jsonl` | Append-only record: `{urn, posted_at, exit_code, image}` per published post. |
-| `~/Library/Logs/lipost-bot.log` | Wrapper logs and Claude stdout/stderr. |
-| `~/code/lipost-bot/images/pending/` | Drop staged images here for the bot to consume. |
-| `~/code/lipost-bot/images/used/` | Successfully-posted images, prefixed with a timestamp. |
-| `~/code/lipost-bot/local.lipost-bot.plist` | Generated launch agent (gitignored — regenerated by `init` and on `baseline_hour` config changes). |
-| `~/.local/bin/lipost-bot` | Symlink to the CLI for `PATH` access. |
-| `~/Library/LaunchAgents/local.lipost-bot.plist` | Symlink to the repo plist; the launch agent. |
+| `~/.config/lipost-bot/state.json` | `last_run_at`, `paused` (chmod 600). |
+| `~/.config/lipost-bot/posts.jsonl` | Append-only post history: `{urn, posted_at, exit_code, draft_slug, source_image}`. |
+| `~/Library/Logs/lipost-bot.log` | Wrapper logs and lipost stdout/stderr. |
+| `~/code/lipost-bot/images/pending/` | Drop staged images here for `generate` to consume. |
+| `~/code/lipost-bot/images/skipped/` | Images Claude said SKIP on, with `<filename>.reason.txt` sidecars. |
+| `~/code/lipost-bot/drafts/<slug>/` | One directory per draft: `image.<ext>` + `meta.json` (status, caption, alt, timestamps, URN). |
+| `~/code/lipost-bot/local.lipost-bot.plist` | Generated launch agent (gitignored). |
+| `~/.local/bin/lipost-bot` | Symlink to the CLI for `PATH`. |
+| `~/Library/LaunchAgents/local.lipost-bot.plist` | Symlink to the repo plist. |
+
+### Draft `meta.json` schema
+
+```json
+{
+  "slug": "20260430T093412_a1b2c3",
+  "status": "pending_approval",
+  "caption": "...",
+  "alt_text": "...",
+  "image_filename": "image.png",
+  "source_filename": "diagram.png",
+  "created_at": "...",
+  "approved_at": null,
+  "rejected_at": null,
+  "posted_at": null,
+  "urn": null,
+  "model": "claude-opus-4-7"
+}
+```
+
+You can edit `meta.json` directly if you want to bulk-approve, fix typos, or change a draft's status — the wrapper trusts what's on disk.
 
 ---
 
 ## Deeper testing
 
-The Step-4 walkthrough is the recommended path. If you want to exercise the safety paths explicitly:
+The Step-4 walkthrough is the recommended path. To exercise individual safety paths:
 
 ```bash
-# 1. Inactive path — `run` ignores active, so use `_cron`:
+# 1. Inactive path — `run` ignores it, so use `_cron`:
 lipost-bot config active false
 lipost-bot _cron        # logs "inactive (config.active=false) — skipping run"
 tail -3 ~/Library/Logs/lipost-bot.log
 lipost-bot config active true
 
-# 2. Pause path — `run` ignores pause, so use `_cron`:
+# 2. Pause path:
 lipost-bot pause
 lipost-bot _cron        # logs "paused — skipping run"
-tail -3 ~/Library/Logs/lipost-bot.log
 lipost-bot resume
 
-# 3. Min-gap path — fire once, then `_cron` again:
-lipost-bot run          # records last_run_at
+# 3. Min-gap path (after a successful post):
 lipost-bot _cron        # logs "only X.Xh since last run … skipping"
 
-# 4. Empty-prompt path:
-mv prompt.md prompt.md.bak
-lipost-bot _cron        # logs "prompt file missing"
-mv prompt.md.bak prompt.md
+# 4. Empty-queue path:
+lipost-bot _cron        # if no approved drafts: logs "no approved drafts in queue"
 
-# 5. Template-marker path:
-# (default state right after init — `_cron` logs "still the template")
+# 5. Dependency-missing path (try without lipost installed):
+mv ~/.config/linkedin-cli/token.json ~/.config/linkedin-cli/token.json.bak
+lipost-bot _cron        # logs "missing token.json"
+mv ~/.config/linkedin-cli/token.json.bak ~/.config/linkedin-cli/token.json
 
-# 6. Missing-image path (with image-mode prompt + empty pending dir):
-mv images/pending/* /tmp/   # if any
-lipost-bot _cron            # logs "prompt requires {{IMAGE_PATH}} but ... is empty"
-mv /tmp/<file> images/pending/
-
-# 7. Dry-run-only Claude run (Claude executes, doesn't actually post):
-echo 'Run `lipost post --dry-run "test"` and report the JSON. Do not publish.' > prompt.md
-lipost-bot run
-tail -n 50 ~/Library/Logs/lipost-bot.log
+# 6. Generate failure path — bad JSON output (rare; Claude usually complies):
+# Edit prompt.md to instruct Claude badly, run `lipost-bot generate`, see the
+# "no valid JSON in claude output" error per image.
 ```
 
 ---
 
 ## Safety notes
 
-- **`bypassPermissions` is wide.** The bot runs Claude with `--permission-mode bypassPermissions` so it doesn't hang on prompts. Inside the working directory (`~/code/lipost-bot`) Claude can read/write files and run shell commands without confirmation. Don't keep secrets there and don't broaden the prompt to invite shell mischief.
-- **The LinkedIn token expires.** Member tokens last ~60 days. When yours expires, `lipost post` will 401 and the bot will fail at runtime. Re-run `lipost auth`. The dependency check verifies the token *file* exists, not that it's still valid.
-- **No retries.** `_cron` records `last_run_at` *before* invoking Claude. So a crash mid-run still counts as "today's run" and won't retry. This prevents double-posting; the tradeoff is that a Claude failure means no post that day.
-- **30-minute hard timeout.** Claude is run with a 30-minute timeout. If it hangs (e.g. an LLM API outage), the wrapper kills it and logs a partial-output snippet.
-- **No queue.** Claude decides what to write at run time. There's no "draft 7 posts and queue them" feature. If you want that, build it into your prompt or extend the wrapper.
+- **`bypassPermissions` is wide.** `generate` runs Claude with `--permission-mode bypassPermissions` so it doesn't hang on prompts. Inside the working directory (`~/code/lipost-bot`) Claude can read/write files and run shell commands without confirmation. Don't keep secrets there.
+- **Human approval is the safety boundary.** Nothing posts until you `review` and approve. Pre-fire, you also still have `lipost delete` if you change your mind after a post lands.
+- **The LinkedIn token expires.** Member tokens last ~60 days. When yours expires, `lipost post` will 401 and `_cron` will leave the draft as `approved` for retry. Re-run `lipost auth`.
+- **No retries inside a run.** `_cron` records `last_run_at` *before* posting. If `lipost post` fails or no URN comes back, the draft stays `approved` for the next scheduled run — but the gap guard means the next attempt is ~24h later.
+- **5-minute hard timeout on the lipost call.** If LinkedIn hangs, `_cron` aborts and the draft stays `approved`.
+- **10-minute timeout on each Claude call** during `generate`. A timeout leaves the source image in `pending/` for retry.
 - **Prompt injection via images.** Claude reads images you stage. A maliciously crafted image with embedded text could try to override your prompt. Stage images you trust.
 
 ---

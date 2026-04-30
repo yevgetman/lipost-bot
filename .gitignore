@@ -7,6 +7,9 @@ prompt.md
 # user image staging (created by `lipost-bot init`)
 images/
 
+# draft queue (created and managed by `lipost-bot generate` / review)
+drafts/
+
 # logs
 *.log
 

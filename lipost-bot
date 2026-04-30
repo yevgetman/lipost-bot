@@ -30,14 +30,20 @@ PLIST_SRC = REPO_DIR / f"{LABEL}.plist"
 PLIST_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 BIN_LINK = HOME / ".local" / "bin" / "lipost-bot"
 
-# Image staging — the user drops files into pending/. The bot picks one per
-# run, has Claude write a caption from it, and moves it to used/ after a
-# successful post. Both dirs are auto-created.
+# Image staging — the user drops files into pending/. `lipost-bot generate`
+# drains pending/ by invoking Claude to write a caption per image, then
+# stores each (image + caption + alt) under drafts/<slug>/ as a draft
+# awaiting human approval. Skipped images get parked under skipped/.
 IMAGES_DIR = REPO_DIR / "images"
 IMAGES_PENDING = IMAGES_DIR / "pending"
-IMAGES_USED = IMAGES_DIR / "used"
+IMAGES_SKIPPED = IMAGES_DIR / "skipped"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
 IMAGE_PLACEHOLDER = "{{IMAGE_PATH}}"
+
+# Drafts directory — one subdirectory per draft, holding the image plus
+# meta.json describing status (pending_approval | approved | rejected | posted).
+DRAFTS_DIR = REPO_DIR / "drafts"
+VALID_STATUSES = {"pending_approval", "approved", "rejected", "posted"}
 
 # Runtime dependency: lipost CLI (https://github.com/yevgetman/lipost)
 LIPOST_CONFIG = HOME / ".config" / "linkedin-cli" / "config.json"
@@ -108,18 +114,118 @@ def list_pending_images() -> list[Path]:
                   if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
 
 
-def pick_image() -> Path | None:
-    candidates = list_pending_images()
-    return random.choice(candidates) if candidates else None
+# ── draft data layer ───────────────────────────────────────────────────────
+
+def make_slug() -> str:
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    rand = "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=6))
+    return f"{ts}_{rand}"
 
 
-def archive_image(img: Path) -> Path:
-    """Move a used image to images/used/ with a timestamp prefix."""
-    IMAGES_USED.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
-    dest = IMAGES_USED / f"{stamp}_{img.name}"
+def list_drafts(status: str | None = None) -> list[dict]:
+    """Return list of {slug, dir, image_path, meta} dicts. status filters if set."""
+    if not DRAFTS_DIR.exists():
+        return []
+    out = []
+    for sub in sorted(DRAFTS_DIR.iterdir()):
+        if not sub.is_dir():
+            continue
+        meta_path = sub / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except json.JSONDecodeError:
+            continue
+        if status and meta.get("status") != status:
+            continue
+        img_filename = meta.get("image_filename")
+        image_path = sub / img_filename if img_filename else None
+        out.append({"slug": sub.name, "dir": sub, "image_path": image_path, "meta": meta})
+    return out
+
+
+def count_drafts_by_status() -> dict:
+    counts = {s: 0 for s in VALID_STATUSES}
+    for d in list_drafts():
+        s = d["meta"].get("status", "pending_approval")
+        counts[s] = counts.get(s, 0) + 1
+    return counts
+
+
+def create_draft(image_src: Path, caption: str, alt_text: str, model: str) -> str:
+    """Move image into a new draft dir under DRAFTS_DIR. Returns slug."""
+    slug = make_slug()
+    draft_dir = DRAFTS_DIR / slug
+    draft_dir.mkdir(parents=True, exist_ok=False)
+
+    image_filename = f"image{image_src.suffix.lower()}"
+    image_dst = draft_dir / image_filename
+    image_src.rename(image_dst)
+
+    meta = {
+        "slug": slug,
+        "status": "pending_approval",
+        "caption": caption.strip(),
+        "alt_text": (alt_text or "").strip(),
+        "image_filename": image_filename,
+        "source_filename": image_src.name,
+        "created_at": now_iso(),
+        "approved_at": None,
+        "rejected_at": None,
+        "posted_at": None,
+        "urn": None,
+        "model": model,
+    }
+    (draft_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return slug
+
+
+def update_draft(slug: str, **changes) -> None:
+    meta_path = DRAFTS_DIR / slug / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta.update(changes)
+    meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def park_skipped_image(img: Path, reason: str) -> Path:
+    """Move an image Claude said SKIP on into images/skipped/ with a reason sidecar."""
+    IMAGES_SKIPPED.mkdir(parents=True, exist_ok=True)
+    dest = IMAGES_SKIPPED / img.name
+    if dest.exists():
+        # avoid clobber
+        stem, suffix = dest.stem, dest.suffix
+        dest = IMAGES_SKIPPED / f"{stem}_{make_slug()[:8]}{suffix}"
     img.rename(dest)
+    (dest.with_suffix(dest.suffix + ".reason.txt")).write_text(f"{now_iso()}\n{reason}\n")
     return dest
+
+
+# Tolerant JSON extractor — Claude sometimes prepends/wraps the object.
+_JSON_OBJ_RE = re.compile(r"\{[^{}]*\}", re.DOTALL)
+
+
+def parse_claude_json(stdout: str) -> dict | None:
+    s = (stdout or "").strip()
+    if not s:
+        return None
+    # Try whole-string parse first
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # Fall back to last {...} block that contains caption or skip
+    matches = _JSON_OBJ_RE.findall(s)
+    for m in reversed(matches):
+        try:
+            obj = json.loads(m)
+            if isinstance(obj, dict) and ("caption" in obj or "skip" in obj):
+                return obj
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def check_dependencies() -> tuple[bool, list[str]]:
@@ -201,11 +307,12 @@ def cmd_init(args: argparse.Namespace) -> None:
     print("\nactive=false (bot is inert). When ready, arm with:")
     print("    lipost-bot config active true")
 
-    # Create the image staging directories so they're discoverable.
+    # Create the staging directories so they're discoverable.
     IMAGES_PENDING.mkdir(parents=True, exist_ok=True)
-    IMAGES_USED.mkdir(parents=True, exist_ok=True)
+    IMAGES_SKIPPED.mkdir(parents=True, exist_ok=True)
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
     (IMAGES_PENDING / ".gitkeep").touch()
-    print(f"Image staging: drop files into {IMAGES_PENDING}/ to enable image posts.")
+    print(f"Drop images into {IMAGES_PENDING}/ — `lipost-bot generate` will drain them into drafts.")
 
     # symlink binary onto PATH
     BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
@@ -346,8 +453,19 @@ def cmd_status(args: argparse.Namespace) -> None:
         "template": "template — edit before going live (will skip)",
         "ready":    "ready",
     }[prompt_state]
-    print(f"  prompt:     {prompt_label}")
-    print(f"  images:     {len(list_pending_images())} pending in {IMAGES_PENDING}")
+    print(f"  prompt:     {prompt_label}  (used by `generate`, not at fire time)")
+
+    counts = count_drafts_by_status()
+    queue_status = (
+        f"approved={counts['approved']}, pending={counts['pending_approval']}, "
+        f"rejected={counts['rejected']}, posted={counts['posted']}"
+    )
+    print(f"  drafts:     {queue_status}")
+    if counts["approved"] == 0 and active:
+        print(f"              ← no approved drafts; next fire will skip. "
+              f"Run: lipost-bot generate, then review.")
+
+    print(f"  images:     {len(list_pending_images())} pending in {IMAGES_PENDING} (run `generate` to consume)")
     print(f"  config:     baseline_hour={cfg['baseline_hour']}, jitter≤{cfg['jitter_max_secs']//3600}h, "
           f"min_gap={cfg['min_hours_between_runs']}h, mode={cfg['permission_mode']}, model={cfg['claude_model']}")
 
@@ -443,25 +561,25 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    """Fire immediately: no jitter, ignore pause and min-gap guard."""
+    """Fire immediately: no jitter, ignore active/pause/min-gap guards."""
     if args.no_fire:
         _print_dry_plan()
         return
-    print("running now (no jitter, ignoring pause and gap guard)...")
-    _do_claude_run(force=True)
+    print("running now (no jitter, ignoring active/pause/gap guards)...")
+    _do_post_run(force=True)
 
 
 def _print_dry_plan() -> None:
-    """Print what `lipost-bot run` would do, without invoking claude."""
+    """Print what `lipost-bot run` would do, without calling lipost."""
     cfg = get_config()
     state = get_state()
     deps_ok, deps_problems = check_dependencies()
-    pstate = _prompt_state()
-    claude_path = shutil.which("claude", path=CRON_PATH) or "<not found on CRON_PATH>"
     lipost_path = shutil.which("lipost", path=CRON_PATH) or "<not found on CRON_PATH>"
 
     last = parse_iso(state.get("last_run_at"))
     gap_h = hours_since(last)
+    next_draft = _next_approved_draft()
+    counts = count_drafts_by_status()
 
     print("=== lipost-bot run --no-fire ===\n")
     print(f"would skip due to: ", end="")
@@ -472,51 +590,49 @@ def _print_dry_plan() -> None:
         reasons.append("paused")
     if gap_h is not None and gap_h < cfg["min_hours_between_runs"]:
         reasons.append(f"min-gap ({gap_h:.1f}h < {cfg['min_hours_between_runs']}h)")
-    if pstate != "ready":
-        reasons.append(f"prompt {pstate}")
+    if next_draft is None:
+        reasons.append("no approved drafts in queue")
     if not deps_ok:
         reasons.append("dependency check")
-    print(", ".join(reasons) if reasons else "(nothing — would fire)")
+    print(", ".join(reasons) if reasons else "(nothing — would post)")
     if reasons:
-        print("  note: `run` ignores `active`, `paused`, and the min-gap guard at runtime; `_cron` (launchd) honors all three.")
+        print("  note: `run` ignores `active`, `paused`, and the min-gap guard at runtime; `_cron` (launchd) honors all three. The queue-empty case is honored by both.")
+    print()
+
+    print(f"queue:         approved={counts['approved']}, pending={counts['pending_approval']}, "
+          f"rejected={counts['rejected']}, posted={counts['posted']}")
+    if next_draft is not None:
+        meta = next_draft["meta"]
+        cap = (meta.get("caption") or "").replace("\n", " ")
+        cap_preview = cap[:120] + ("…" if len(cap) > 120 else "")
+        print(f"next draft:    {next_draft['slug']}")
+        print(f"  approved at: {meta.get('approved_at') or '?'}")
+        print(f"  image:       {next_draft['image_path']}")
+        print(f"  alt:         {meta.get('alt_text', '')}")
+        print(f"  caption:     {cap_preview}")
     print()
 
     print(f"cwd:           {REPO_DIR}")
-    print(f"claude path:   {claude_path}")
     print(f"lipost path:   {lipost_path}")
     print(f"PATH (cron):   {CRON_PATH}")
-    print(f"prompt file:   {PROMPT_FILE} ({pstate})")
-    print(f"prompt size:   {PROMPT_FILE.stat().st_size if PROMPT_FILE.exists() else 0} bytes")
-
-    prompt_text_preview = PROMPT_FILE.read_text() if PROMPT_FILE.exists() else ""
-    image_mode = IMAGE_PLACEHOLDER in prompt_text_preview
-    pending = list_pending_images()
-    if image_mode:
-        candidate = pending[0].name if pending else "<none — would skip>"
-        print(f"image mode:    on ({len(pending)} pending; e.g. {candidate})")
-    else:
-        print(f"image mode:    off (prompt has no {IMAGE_PLACEHOLDER})")
-    print(f"model:         {cfg['claude_model']}")
-    print(f"perm mode:     {cfg['permission_mode']}")
-    print(f"timeout:       30 min")
+    print(f"timeout:       5 min (lipost call)")
     print()
 
-    print("command:")
-    print(f"  {claude_path} -p \"$(cat {PROMPT_FILE})\" "
-          f"--permission-mode {cfg['permission_mode']} --model {cfg['claude_model']}")
-    print()
+    if next_draft is not None:
+        meta = next_draft["meta"]
+        cmd_preview = f'{lipost_path} post --image "{next_draft["image_path"]}"'
+        if meta.get("alt_text"):
+            cmd_preview += f' --alt "{meta["alt_text"]}"'
+        cmd_preview += ' "<caption>"'
+        print("command:")
+        print(f"  {cmd_preview}")
+        print()
 
     if deps_problems:
         print("dependency problems:")
         for p in deps_problems:
             print(f"  - {p}")
         print()
-
-    if PROMPT_FILE.exists() and PROMPT_FILE.stat().st_size > 0:
-        text = PROMPT_FILE.read_text()
-        print("--- prompt.md ---")
-        print(text.rstrip())
-        print("--- end prompt.md ---")
 
 
 def cmd_posts(args: argparse.Namespace) -> None:
@@ -574,26 +690,274 @@ def cmd_logs(args: argparse.Namespace) -> None:
 
 def cmd_images(args: argparse.Namespace) -> None:
     if args.open:
-        target = IMAGES_USED if args.used else IMAGES_PENDING
+        target = IMAGES_SKIPPED if args.skipped else IMAGES_PENDING
         target.mkdir(parents=True, exist_ok=True)
         subprocess.run(["open", str(target)])
         print(f"opened {target} in Finder")
         return
 
     pending = list_pending_images()
-    used = sorted(IMAGES_USED.iterdir()) if IMAGES_USED.exists() else []
+    skipped = sorted(p for p in IMAGES_SKIPPED.iterdir()
+                     if p.is_file() and p.suffix.lower() in IMAGE_EXTS) if IMAGES_SKIPPED.exists() else []
 
     print(f"pending ({IMAGES_PENDING}): {len(pending)} file(s)")
     for p in pending:
         size = p.stat().st_size
         print(f"  {p.name} ({size:,} bytes)")
-    print(f"\nused ({IMAGES_USED}): {len(used)} file(s)")
-    for p in used[-10:]:
-        print(f"  {p.name}")
-    if len(used) > 10:
-        print(f"  … {len(used) - 10} older")
+    if skipped:
+        print(f"\nskipped ({IMAGES_SKIPPED}): {len(skipped)} file(s) Claude said SKIP on")
+        for p in skipped[-10:]:
+            print(f"  {p.name}")
+        if len(skipped) > 10:
+            print(f"  … {len(skipped) - 10} older")
     print(f"\nDrop new images into {IMAGES_PENDING}/ — supported: {', '.join(sorted(IMAGE_EXTS))}")
-    print(f"Open in Finder: lipost-bot images --open  (add --used to open the archive)")
+    print(f"Open in Finder: lipost-bot images --open  (add --skipped to open the skipped dir)")
+
+
+# ── generate / review / drafts ─────────────────────────────────────────────
+
+def cmd_generate(args: argparse.Namespace) -> None:
+    """Drain images/pending/, run Claude per image, save drafts as pending_approval."""
+    cfg = get_config()
+
+    ok, problems = check_dependencies()
+    if not ok:
+        print("dependency check failed:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        sys.exit(1)
+
+    pstate = _prompt_state()
+    if pstate != "ready":
+        print(f"prompt is not ready: {pstate}.", file=sys.stderr)
+        print(f"edit {PROMPT_FILE} (or `lipost-bot prompt`) and remove the TEMPLATE marker.", file=sys.stderr)
+        sys.exit(1)
+
+    prompt_template = PROMPT_FILE.read_text()
+    if IMAGE_PLACEHOLDER not in prompt_template:
+        print(f"prompt has no {IMAGE_PLACEHOLDER} placeholder; image-mode is required for generate.", file=sys.stderr)
+        sys.exit(1)
+
+    pending = list_pending_images()
+    if not pending:
+        print(f"no images in {IMAGES_PENDING}.")
+        print(f"drop JPEG/PNG/GIF files there or open with: lipost-bot images --open")
+        return
+
+    DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
+    claude_path = shutil.which("claude") or "claude"
+
+    print(f"generating drafts for {len(pending)} image(s) using {cfg['claude_model']}...")
+    print(f"each call may take 10–60s. Press Ctrl-C to abort (in-progress image will be left in pending/).\n")
+
+    saved = skipped = failed = 0
+    for i, img in enumerate(pending, 1):
+        print(f"[{i}/{len(pending)}] {img.name}", flush=True)
+        prompt_text = prompt_template.replace(IMAGE_PLACEHOLDER, str(img.resolve()))
+
+        try:
+            proc = subprocess.run(
+                [claude_path, "-p", prompt_text,
+                 "--permission-mode", cfg["permission_mode"],
+                 "--model", cfg["claude_model"]],
+                capture_output=True, text=True, timeout=10 * 60,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  ✗ claude timed out after 10m; image left in pending")
+            failed += 1
+            continue
+        except KeyboardInterrupt:
+            print("\naborted by user.")
+            break
+
+        if proc.returncode != 0:
+            print(f"  ✗ claude exited rc={proc.returncode}")
+            if proc.stderr:
+                print(f"    stderr: {proc.stderr.strip()[:200]}")
+            failed += 1
+            continue
+
+        parsed = parse_claude_json(proc.stdout)
+        if not parsed:
+            print(f"  ✗ no valid JSON in claude output (last 200 chars):")
+            print(f"    {proc.stdout.strip()[-200:]}")
+            failed += 1
+            continue
+
+        if parsed.get("skip"):
+            reason = parsed.get("reason", "(no reason given)")
+            print(f"  → SKIP: {reason}")
+            park_skipped_image(img, reason)
+            skipped += 1
+            continue
+
+        caption = (parsed.get("caption") or "").strip()
+        alt = (parsed.get("alt") or parsed.get("alt_text") or "").strip()
+        if not caption:
+            print(f"  ✗ JSON has no caption: {parsed}")
+            failed += 1
+            continue
+
+        slug = create_draft(img, caption, alt, cfg["claude_model"])
+        preview = caption[:80] + ("…" if len(caption) > 80 else "")
+        print(f"  ✓ draft {slug}")
+        print(f"    {preview}")
+        saved += 1
+
+    print(f"\ndone. saved={saved}, skipped={skipped}, failed={failed}.")
+    if saved:
+        print(f"review with: lipost-bot review")
+
+
+def cmd_review(args: argparse.Namespace) -> None:
+    """Walk drafts pending approval, prompt to approve/reject/edit each."""
+    drafts = list_drafts(status="pending_approval")
+    drafts.sort(key=lambda d: d["meta"].get("created_at") or "")
+
+    if not drafts:
+        print("no drafts pending approval.")
+        counts = count_drafts_by_status()
+        print(f"queue: pending={counts['pending_approval']}, "
+              f"approved={counts['approved']}, rejected={counts['rejected']}, posted={counts['posted']}")
+        return
+
+    print(f"{len(drafts)} draft(s) pending approval. Press q at any prompt to stop.\n")
+
+    for i, draft in enumerate(drafts, 1):
+        action = _review_one(draft, i, len(drafts))
+        if action == "quit":
+            print(f"\nstopped. {len(drafts) - i + 1} remaining drafts left as pending_approval.")
+            break
+
+    counts = count_drafts_by_status()
+    print(f"\nqueue: pending={counts['pending_approval']}, "
+          f"approved={counts['approved']}, rejected={counts['rejected']}, posted={counts['posted']}")
+
+
+def _review_one(draft: dict, i: int, total: int) -> str:
+    """Returns 'next' or 'quit'."""
+    while True:
+        print("\033[2J\033[H", end="")  # clear screen, home cursor
+        meta = draft["meta"]
+        print(f"━━━ draft {i}/{total} ━━━")
+        print(f"slug:     {draft['slug']}")
+        print(f"created:  {meta.get('created_at', '?')}")
+        print(f"source:   {meta.get('source_filename', '?')}  (model: {meta.get('model', '?')})")
+        print(f"image:    {draft['image_path']}")
+        print()
+        print("caption:")
+        for line in (meta.get("caption") or "").splitlines() or [""]:
+            print(f"  {line}")
+        print()
+        print("alt:")
+        print(f"  {meta.get('alt_text', '')}")
+        print()
+
+        if draft["image_path"] and draft["image_path"].exists():
+            subprocess.Popen(["open", "-a", "Preview", str(draft["image_path"])],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        choice = input("[a]pprove  [r]eject  [e]dit  [s]kip  [q]uit > ").strip().lower()
+        if choice in ("a", "approve"):
+            update_draft(draft["slug"], status="approved", approved_at=now_iso())
+            print(f"  ✓ approved")
+            return "next"
+        elif choice in ("r", "reject"):
+            update_draft(draft["slug"], status="rejected", rejected_at=now_iso())
+            print(f"  ✗ rejected")
+            return "next"
+        elif choice in ("s", "skip"):
+            print(f"  → skipped (still pending_approval)")
+            return "next"
+        elif choice in ("q", "quit"):
+            return "quit"
+        elif choice in ("e", "edit"):
+            _edit_draft_text(draft)
+            # loop, re-render with updated text
+        else:
+            print(f"  unknown choice '{choice}', try again.")
+            input("  [enter] to continue ")
+
+
+_EDIT_TEMPLATE = """# Edit caption and alt text below. Save and quit when done.
+# Anything outside the >>> / <<< markers is ignored.
+# Leave a section's content empty to clear it.
+
+CAPTION>>>
+{caption}
+<<<CAPTION
+
+ALT>>>
+{alt}
+<<<ALT
+"""
+
+_SECTION_RE_TEMPLATE = r"{name}>>>\s*\n(.*?)\n<<<{name}"
+
+
+def _edit_draft_text(draft: dict) -> None:
+    import tempfile
+    meta = draft["meta"]
+    body = _EDIT_TEMPLATE.format(caption=meta.get("caption", ""), alt=meta.get("alt_text", ""))
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tf:
+        tf.write(body)
+        tmp = tf.name
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, tmp])
+    text = Path(tmp).read_text()
+    Path(tmp).unlink(missing_ok=True)
+
+    cap_m = re.search(_SECTION_RE_TEMPLATE.format(name="CAPTION"), text, re.DOTALL)
+    alt_m = re.search(_SECTION_RE_TEMPLATE.format(name="ALT"), text, re.DOTALL)
+    if not cap_m or not alt_m:
+        print("  ✗ failed to parse edited file (CAPTION/ALT markers missing). no changes made.")
+        input("  [enter] to continue ")
+        return
+    new_cap = cap_m.group(1).strip()
+    new_alt = alt_m.group(1).strip()
+    if not new_cap:
+        print("  ✗ caption is empty. no changes made.")
+        input("  [enter] to continue ")
+        return
+    update_draft(draft["slug"], caption=new_cap, alt_text=new_alt)
+    draft["meta"]["caption"] = new_cap
+    draft["meta"]["alt_text"] = new_alt
+    print("  ✓ updated")
+
+
+def cmd_drafts(args: argparse.Namespace) -> None:
+    """List drafts grouped by status."""
+    all_drafts = list_drafts()
+    if args.status:
+        if args.status not in VALID_STATUSES:
+            print(f"unknown status '{args.status}'. valid: {', '.join(sorted(VALID_STATUSES))}",
+                  file=sys.stderr)
+            sys.exit(1)
+        all_drafts = [d for d in all_drafts if d["meta"].get("status") == args.status]
+
+    if not all_drafts:
+        print("no drafts." if not args.status else f"no drafts with status={args.status}.")
+        return
+
+    # Group by status
+    by_status: dict[str, list[dict]] = {}
+    for d in all_drafts:
+        by_status.setdefault(d["meta"].get("status", "pending_approval"), []).append(d)
+
+    order = ["pending_approval", "approved", "posted", "rejected"]
+    for status in order:
+        if status not in by_status:
+            continue
+        items = by_status[status]
+        items.sort(key=lambda d: d["meta"].get("created_at") or "", reverse=True)
+        print(f"\n{status} ({len(items)}):")
+        for d in items[:args.limit]:
+            meta = d["meta"]
+            cap = (meta.get("caption") or "").replace("\n", " ")
+            cap = cap[:70] + ("…" if len(cap) > 70 else "")
+            print(f"  {d['slug']}  {cap}")
+        if len(items) > args.limit:
+            print(f"  … {len(items) - args.limit} older")
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
@@ -612,10 +976,20 @@ def cmd_uninstall(args: argparse.Namespace) -> None:
 # ── _cron: the launchd entry point ─────────────────────────────────────────
 
 def cmd_cron(args: argparse.Namespace) -> None:
-    _do_claude_run(force=False)
+    _do_post_run(force=False)
 
 
-def _do_claude_run(force: bool) -> None:
+def _next_approved_draft() -> dict | None:
+    """Oldest approved draft (by approved_at, falling back to created_at)."""
+    approved = list_drafts(status="approved")
+    if not approved:
+        return None
+    approved.sort(key=lambda d: d["meta"].get("approved_at") or d["meta"].get("created_at") or "")
+    return approved[0]
+
+
+def _do_post_run(force: bool) -> None:
+    """Pop the oldest approved draft and publish it via lipost. No Claude here."""
     cfg = get_config()
     state = get_state()
 
@@ -634,16 +1008,6 @@ def _do_claude_run(force: bool) -> None:
             log(f"only {gap_h:.1f}h since last run (min {cfg['min_hours_between_runs']}h) — skipping")
             return
 
-    pstate = _prompt_state()
-    if pstate != "ready":
-        reason = {
-            "missing":  f"prompt file missing: {PROMPT_FILE}",
-            "empty":    f"prompt file empty: {PROMPT_FILE}",
-            "template": f"prompt is still the template (remove the TEMPLATE marker line): {PROMPT_FILE}",
-        }[pstate]
-        log(f"{reason} — skipping run")
-        return
-
     ok, problems = check_dependencies()
     if not ok:
         for p in problems:
@@ -651,45 +1015,50 @@ def _do_claude_run(force: bool) -> None:
         log("skipping run (run `lipost-bot status` for details)")
         return
 
-    prompt_text = PROMPT_FILE.read_text()
-    selected_image: Path | None = None
-    if IMAGE_PLACEHOLDER in prompt_text:
-        selected_image = pick_image()
-        if selected_image is None:
-            log(f"prompt requires {IMAGE_PLACEHOLDER} but {IMAGES_PENDING} is empty — skipping run")
-            return
-        prompt_text = prompt_text.replace(IMAGE_PLACEHOLDER, str(selected_image.resolve()))
-        log(f"selected image: {selected_image.name}")
+    draft = _next_approved_draft()
+    if draft is None:
+        counts = count_drafts_by_status()
+        log(f"no approved drafts in queue (pending={counts['pending_approval']}, approved=0) "
+            f"— skipping run. Generate with: lipost-bot generate; review with: lipost-bot review")
+        return
 
     if not force:
         jitter = random.randint(0, cfg["jitter_max_secs"])
-        log(f"fired; sleeping {jitter}s (~{jitter//3600}h {jitter%3600//60}m)")
+        log(f"fired; sleeping {jitter}s (~{jitter//3600}h {(jitter%3600)//60}m); will post draft {draft['slug']}")
         time.sleep(jitter)
 
-    # Mark last_run_at *before* invoking claude — prevents double-fire if claude crashes
+    # Mark last_run_at *before* invoking lipost — prevents double-fire on crash
     state["last_run_at"] = now_iso()
     save_json(STATE_FILE, state)
 
-    claude_path = shutil.which("claude", path=CRON_PATH) or "claude"
-    log(f"starting claude ({claude_path}, model={cfg['claude_model']})")
-
-    env = {**os.environ, "PATH": CRON_PATH}
-    try:
-        proc = subprocess.run(
-            [claude_path, "-p", prompt_text,
-             "--permission-mode", cfg["permission_mode"],
-             "--model", cfg["claude_model"]],
-            cwd=str(REPO_DIR),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=30 * 60,  # 30-min hard cap
-        )
-    except subprocess.TimeoutExpired as e:
-        log(f"claude timed out after 30m; partial output: {(e.stdout or '')[-500:]}")
+    # Re-read draft after the sleep — user may have changed status during the window
+    draft_dir = DRAFTS_DIR / draft["slug"]
+    if not (draft_dir / "meta.json").exists():
+        log(f"draft {draft['slug']} disappeared during jitter — skipping")
+        return
+    meta = json.loads((draft_dir / "meta.json").read_text())
+    if meta.get("status") != "approved":
+        log(f"draft {draft['slug']} is no longer approved (status={meta.get('status')}) — skipping")
         return
 
-    # Append claude's output to the log
+    image_path = draft_dir / meta["image_filename"]
+    caption = meta.get("caption") or ""
+    alt = meta.get("alt_text") or ""
+
+    lipost_path = shutil.which("lipost", path=CRON_PATH) or "lipost"
+    cmd = [lipost_path, "post", "--image", str(image_path)]
+    if alt:
+        cmd.extend(["--alt", alt])
+    cmd.append(caption)
+
+    log(f"posting draft {draft['slug']} via lipost ({lipost_path})")
+    env = {**os.environ, "PATH": CRON_PATH}
+    try:
+        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5 * 60)
+    except subprocess.TimeoutExpired as e:
+        log(f"lipost timed out after 5m; partial output: {(e.stdout or '')[-500:]}")
+        return
+
     with LOG_FILE.open("a") as f:
         if proc.stdout:
             f.write(proc.stdout)
@@ -698,28 +1067,31 @@ def _do_claude_run(force: bool) -> None:
         if proc.stderr:
             f.write("[stderr] " + proc.stderr.replace("\n", "\n[stderr] ") + "\n")
 
-    log(f"claude exited rc={proc.returncode}")
+    log(f"lipost exited rc={proc.returncode}")
 
-    # Parse URNs from output, record to posts.jsonl, archive image on first match.
-    archived_image: Path | None = None
-    for m in URN_RE.finditer(proc.stdout or ""):
-        urn = m.group(1)
-        if selected_image is not None and archived_image is None and selected_image.exists():
-            archived_image = archive_image(selected_image)
-            log(f"archived image to {archived_image.relative_to(REPO_DIR)}")
-        entry = {
-            "urn": urn,
-            "posted_at": now_iso(),
-            "exit_code": proc.returncode,
-            "image": archived_image.name if archived_image else None,
-        }
-        POSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with POSTS_FILE.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-        log(f"recorded post {urn}")
+    if proc.returncode != 0:
+        log(f"lipost post failed; draft {draft['slug']} stays approved for retry on next run")
+        return
 
-    if selected_image is not None and archived_image is None:
-        log(f"no URN found in output — leaving {selected_image.name} in pending/")
+    m = URN_RE.search(proc.stdout or "")
+    if not m:
+        log(f"no URN found in lipost output; draft {draft['slug']} stays approved for retry")
+        return
+
+    urn = m.group(1)
+    update_draft(draft["slug"], status="posted", posted_at=now_iso(), urn=urn)
+    log(f"posted {urn} (draft {draft['slug']})")
+
+    entry = {
+        "urn": urn,
+        "posted_at": now_iso(),
+        "exit_code": proc.returncode,
+        "draft_slug": draft["slug"],
+        "source_image": meta.get("source_filename"),
+    }
+    POSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with POSTS_FILE.open("a") as f:
+        f.write(json.dumps(entry) + "\n")
 
 
 # ── arg parsing ────────────────────────────────────────────────────────────
@@ -742,9 +1114,16 @@ def main() -> None:
     sub.add_parser("resume", help="undo pause").set_defaults(func=cmd_resume)
     sub.add_parser("start", help="load the launchd job").set_defaults(func=cmd_start)
     sub.add_parser("stop", help="unload the launchd job").set_defaults(func=cmd_stop)
-    p_run = sub.add_parser("run", help="fire claude immediately (no jitter, ignores pause + gap)")
+    sub.add_parser("generate", help="drain images/pending/ — Claude writes a caption per image, saves drafts as pending_approval").set_defaults(func=cmd_generate)
+    sub.add_parser("review", help="walk drafts pending approval; opens each image in Preview, prompts to approve/reject/edit").set_defaults(func=cmd_review)
+    p_drafts = sub.add_parser("drafts", help="list drafts grouped by status")
+    p_drafts.add_argument("--status", help=f"filter to one of: {', '.join(sorted(VALID_STATUSES))}")
+    p_drafts.add_argument("--limit", type=int, default=10, help="max items per status (default 10)")
+    p_drafts.set_defaults(func=cmd_drafts)
+
+    p_run = sub.add_parser("run", help="post the next approved draft now (no jitter, ignores active/paused/gap)")
     p_run.add_argument("--no-fire", action="store_true",
-                       help="show the resolved plan (cwd, paths, env, prompt, command) without invoking claude")
+                       help="show the resolved plan (queue counts, next draft, lipost path, deps) without calling lipost")
     p_run.set_defaults(func=cmd_run)
     sub.add_parser("next", help="print the next scheduled window").set_defaults(func=cmd_next)
     sub.add_parser("prompt", help=f"open {PROMPT_FILE.name} in $EDITOR").set_defaults(func=cmd_prompt)
@@ -760,8 +1139,8 @@ def main() -> None:
     p_logs.set_defaults(func=cmd_logs)
 
     p_images = sub.add_parser("images", help=f"list pending and used images under {IMAGES_DIR}")
-    p_images.add_argument("--open", action="store_true", help="open the pending dir in Finder (combine with --used to open the archive)")
-    p_images.add_argument("--used", action="store_true", help="with --open, open images/used/ instead")
+    p_images.add_argument("--open", action="store_true", help="open the pending dir in Finder (combine with --skipped to open the skipped dir)")
+    p_images.add_argument("--skipped", action="store_true", help="with --open, open images/skipped/ instead")
     p_images.set_defaults(func=cmd_images)
     sub.add_parser("uninstall", help="remove launchd job + PATH symlink (keeps config + history)").set_defaults(func=cmd_uninstall)
 
