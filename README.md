@@ -14,7 +14,7 @@ Three phases, each triggered separately:
 
 **Phase 1 — Generate** (`lipost-bot generate`, manual). Drains everything in `images/pending/`. For each image, runs Claude Code with your `prompt.md`. Claude reads the image and outputs a JSON object with a caption + alt text. Each `(image, caption, alt)` is saved as a draft directory under `drafts/<slug>/` with status `pending_approval`. Images Claude SKIPs are moved to `images/skipped/` with the reason recorded.
 
-**Phase 2 — Review** (`lipost-bot review`, manual). Walks pending drafts. For each one: opens the image in Preview.app, displays caption + alt in the terminal, prompts `[a]pprove / [r]eject / [e]dit / [s]kip / [q]uit`. `e` opens caption + alt in `$EDITOR` for revision. Approved drafts move to status `approved` and join the posting queue.
+**Phase 2 — Review** (`lipost-bot review`, manual). Walks pending drafts. For each one: opens the image in Preview.app, displays caption + alt in the terminal, prompts `[a]pprove / [r]eject / [e]dit / [g]enerate-again / [s]kip / [q]uit`. `e` opens caption + alt in `$EDITOR` for manual revision. `g` re-invokes Claude with optional feedback (e.g. "make it shorter", "less corporate") plus the previous draft as context, then re-renders so you can iterate. Approved drafts move to status `approved` and join the posting queue.
 
 **Phase 3 — Post** (launchd, automatic; or `lipost-bot run`, manual). When `launchd` fires at the daily `baseline_hour`, the wrapper sleeps a random `0…N` seconds (jitter), then picks the **oldest approved draft** and runs `lipost post --image <path> --alt "<alt>" "<caption>"`. On success, the draft's status flips to `posted` and the URN is recorded. **No Claude at fire time** — the LLM work happened during Phase 1.
 
@@ -227,7 +227,7 @@ lipost-bot posts               # post history (URN + caption ref)
 | `config <key>` | Print one key. |
 | `config <key> <value>` | Update one key (validated). Auto-reloads launchd if `baseline_hour` changes. |
 | `generate` | Drain `images/pending/`. Calls Claude per image. Saves drafts as `pending_approval`. Skipped images go to `images/skipped/` with a reason sidecar. |
-| `review` | TUI for pending drafts: image opens in Preview, caption + alt in terminal, prompts `[a]pprove / [r]eject / [e]dit / [s]kip / [q]uit`. |
+| `review` | TUI for pending drafts: image opens in Preview, caption + alt in terminal, prompts `[a]pprove / [r]eject / [e]dit / [g]enerate-again / [s]kip / [q]uit`. `[e]` opens caption + alt in `$EDITOR`. `[g]` re-invokes Claude with optional feedback (e.g. "make it shorter") plus the previous draft as context, replaces the caption + alt in `meta.json`, and re-renders so you can review the rewrite. |
 | `drafts [--status STATUS] [--limit N]` | List drafts grouped by status (`pending_approval`, `approved`, `rejected`, `posted`). |
 | `pause` / `resume` | Set/clear `paused` in state. `_cron` skips while paused. |
 | `start` / `stop` | `launchctl load -w` / `unload` the plist. |
