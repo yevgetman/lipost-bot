@@ -387,8 +387,66 @@ def cmd_stop(args: argparse.Namespace) -> None:
 
 def cmd_run(args: argparse.Namespace) -> None:
     """Fire immediately: no jitter, ignore pause and min-gap guard."""
+    if args.no_fire:
+        _print_dry_plan()
+        return
     print("running now (no jitter, ignoring pause and gap guard)...")
     _do_claude_run(force=True)
+
+
+def _print_dry_plan() -> None:
+    """Print what `lipost-bot run` would do, without invoking claude."""
+    cfg = get_config()
+    state = get_state()
+    deps_ok, deps_problems = check_dependencies()
+    pstate = _prompt_state()
+    claude_path = shutil.which("claude", path=CRON_PATH) or "<not found on CRON_PATH>"
+    lipost_path = shutil.which("lipost", path=CRON_PATH) or "<not found on CRON_PATH>"
+
+    last = parse_iso(state.get("last_run_at"))
+    gap_h = hours_since(last)
+
+    print("=== lipost-bot run --no-fire ===\n")
+    print(f"would skip due to: ", end="")
+    reasons = []
+    if state.get("paused"):
+        reasons.append("paused")
+    if gap_h is not None and gap_h < cfg["min_hours_between_runs"]:
+        reasons.append(f"min-gap ({gap_h:.1f}h < {cfg['min_hours_between_runs']}h)")
+    if pstate != "ready":
+        reasons.append(f"prompt {pstate}")
+    if not deps_ok:
+        reasons.append("dependency check")
+    print(", ".join(reasons) if reasons else "(nothing — would fire)")
+    if reasons:
+        print("  note: `run` ignores `paused` and the min-gap guard at runtime; `_cron` (launchd) does not.")
+    print()
+
+    print(f"cwd:           {REPO_DIR}")
+    print(f"claude path:   {claude_path}")
+    print(f"lipost path:   {lipost_path}")
+    print(f"PATH (cron):   {CRON_PATH}")
+    print(f"prompt file:   {PROMPT_FILE} ({pstate})")
+    print(f"prompt size:   {PROMPT_FILE.stat().st_size if PROMPT_FILE.exists() else 0} bytes")
+    print(f"perm mode:     {cfg['permission_mode']}")
+    print(f"timeout:       30 min")
+    print()
+
+    print("command:")
+    print(f"  {claude_path} -p \"$(cat {PROMPT_FILE})\" --permission-mode {cfg['permission_mode']}")
+    print()
+
+    if deps_problems:
+        print("dependency problems:")
+        for p in deps_problems:
+            print(f"  - {p}")
+        print()
+
+    if PROMPT_FILE.exists() and PROMPT_FILE.stat().st_size > 0:
+        text = PROMPT_FILE.read_text()
+        print("--- prompt.md ---")
+        print(text.rstrip())
+        print("--- end prompt.md ---")
 
 
 def cmd_posts(args: argparse.Namespace) -> None:
@@ -478,13 +536,13 @@ def _do_claude_run(force: bool) -> None:
             log(f"only {gap_h:.1f}h since last run (min {cfg['min_hours_between_runs']}h) — skipping")
             return
 
-    state = _prompt_state()
-    if state != "ready":
+    pstate = _prompt_state()
+    if pstate != "ready":
         reason = {
             "missing":  f"prompt file missing: {PROMPT_FILE}",
             "empty":    f"prompt file empty: {PROMPT_FILE}",
             "template": f"prompt is still the template (remove the TEMPLATE marker line): {PROMPT_FILE}",
-        }[state]
+        }[pstate]
         log(f"{reason} — skipping run")
         return
 
@@ -566,7 +624,10 @@ def main() -> None:
     sub.add_parser("resume", help="undo pause").set_defaults(func=cmd_resume)
     sub.add_parser("start", help="load the launchd job").set_defaults(func=cmd_start)
     sub.add_parser("stop", help="unload the launchd job").set_defaults(func=cmd_stop)
-    sub.add_parser("run", help="fire claude immediately (no jitter, ignores pause + gap)").set_defaults(func=cmd_run)
+    p_run = sub.add_parser("run", help="fire claude immediately (no jitter, ignores pause + gap)")
+    p_run.add_argument("--no-fire", action="store_true",
+                       help="show the resolved plan (cwd, paths, env, prompt, command) without invoking claude")
+    p_run.set_defaults(func=cmd_run)
     sub.add_parser("next", help="print the next scheduled window").set_defaults(func=cmd_next)
     sub.add_parser("prompt", help=f"open {PROMPT_FILE.name} in $EDITOR").set_defaults(func=cmd_prompt)
 

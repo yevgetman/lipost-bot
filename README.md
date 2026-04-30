@@ -70,6 +70,7 @@ lipost-bot resume              # undo pause
 | `start` | `launchctl load -w` the plist. |
 | `stop` | `launchctl unload` the plist. The bot is fully off the schedule. |
 | `run` | Fire `_cron` immediately, no jitter, ignoring pause + min-gap guard. For testing. |
+| `run --no-fire` | Print the resolved plan (cwd, claude/lipost paths, PATH, prompt state, full command, prompt body) without invoking Claude. Useful for verifying the bot's environment matches what you expect — especially differences between your shell PATH and the launchd-context PATH. |
 | `next` | Print the next scheduled window (e.g. `2026-05-01 09:00 – 21:00`). |
 | `prompt` | Open `prompt.md` in `$EDITOR` (defaults to `vi`). |
 | `posts [--limit N]` | List recorded URNs, newest first. |
