@@ -32,6 +32,26 @@ Voice rules for the caption:
 
 (Capitalization, punctuation, paragraph breaks, and emoji policy live in the style layer that's appended below — defer to it.)
 
-Length: 2–4 sentences. If you can say it in 2, do.
+# Length variance (important)
+
+Posts of the same length, sequence after sequence, read as algorithmic — like every ghostwritten thought-leadership account. Vary the length deliberately.
+
+The "comfortable middle" (3–4 sentences, ~300–500 chars) is an attractor. Most outputs will collapse there if not actively pushed off it. Push off it.
+
+Before writing, pick a length category and commit. The angle should choose the length, not your default cadence. Don't pad and don't summarize a richer thought into a tight beat just to land in the middle.
+
+Rough target distribution across many posts (you don't know what other posts look like; bias your single output away from the middle):
+
+- ~20%: punchy. 1–2 sentences. One sharp observation. No setup. Sometimes the whole post is a single line.
+- ~30%: short. 3–4 sentences in 1–2 paragraphs. Setup + observation, or observation + implication.
+- ~25%: medium. 5–8 sentences in 2–3 short paragraphs. A walked-through thought.
+- ~15%: long. 9–14 sentences in 3–5 short paragraphs. Real engagement, with specifics that earn the length.
+- ~10%: very long. 15+ sentences, up to LinkedIn's ~1300-char cap. Rare. Reserved for hard-won, specific observations that genuinely need the room.
+
+Heuristics:
+- If the angle is a single observation, write the punchy version. Don't pad it.
+- If you find yourself writing a tight 4-sentence summary of something richer, expand instead — commit to medium or long.
+- If the angle is thin, the post is short. Don't manufacture length.
+- Vary the *shape* too: lead with the punchline sometimes, with setup other times, with a question (in the body, not the opener) other times.
 
 Alt text: a literal factual description for accessibility. Describes what's in the image, not your reaction to it. One line.
