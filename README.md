@@ -18,6 +18,8 @@ A tiny launchd-driven autonomous LinkedIn poster. Once a day, at a randomized hu
 6. The bot scrapes the `urn:li:share:…` from Claude's output, appends it to `posts.jsonl`, and (if image mode) moves the image to `images/used/<timestamp>_<filename>` so it's never reused.
 7. Min-hours-between-runs guard (default 20h) prevents accidental double-posting on the same day.
 
+A master `active` switch (default `false` after install) gates everything: until you set it to `true`, every scheduled fire skips. `lipost-bot run` for manual testing ignores this gate so you can verify end-to-end before arming.
+
 ---
 
 ## Prerequisites
@@ -54,7 +56,12 @@ chmod +x lipost-bot
 4. Create `images/pending/` and `images/used/` under the repo for image staging.
 5. Generate `local.lipost-bot.plist`, symlink it into `~/Library/LaunchAgents/`, and `launchctl load -w` it.
 
-After this, the schedule is **live but inert** — the bot is loaded into `launchd`, but `prompt.md` still contains the unedited template, so every fire will skip until you customize it.
+After this, the schedule is **live but inert**. The bot is loaded into `launchd`, but two independent gates keep it from posting:
+
+1. **`active=false`** in `config.json` — the master arm switch. `init` always writes `false`. The bot will not run until you explicitly flip it to `true`. (`lipost-bot run` for manual testing ignores this; `_cron` honors it.)
+2. **The `<!-- TEMPLATE: … -->` marker** on line 1 of `prompt.md` — until you delete it, every run skips with `prompt is still the template`.
+
+Both must be cleared before the bot will publish anything autonomously.
 
 Verify with:
 
@@ -62,7 +69,7 @@ Verify with:
 lipost-bot status
 ```
 
-You should see `deps: OK`, `launchd: loaded`, and `prompt: template — edit before going live (will skip)`.
+You should see `active: False ← inert`, `deps: OK`, `launchd: loaded`, and `prompt: template — edit before going live (will skip)`.
 
 ---
 
@@ -78,6 +85,7 @@ Update one with `lipost-bot config <key> <value>` (validated and cast to the rig
 
 | Key | Default | What it controls |
 | --- | --- | --- |
+| `active` | `false` | Master arm switch. `init` writes `false` so the bot is **inert by default after install** — every scheduled fire skips with `inactive (config.active=false) — skipping run`. Manually flip to `true` only after you've reviewed the prompt and staged any images. `lipost-bot run` ignores this (so testing is unaffected); `_cron` honors it. |
 | `baseline_hour` | `9` | Hour (0–23) at which `launchd` fires the bot, before jitter. |
 | `jitter_max_secs` | `43200` (12h) | Max seconds the wrapper sleeps after baseline before invoking Claude. Default gives a 09:00–21:00 run window. Set to `0` for a deterministic fire at exactly `baseline_hour:00`. |
 | `min_hours_between_runs` | `20` | If the previous run started less than this many hours ago, `_cron` skips. Prevents accidental double-posting. |
@@ -162,7 +170,7 @@ lipost-bot run --no-fire
 Prints cwd, resolved `claude` and `lipost` paths, the launchd-context PATH, prompt body, image mode (on/off + which image would be picked), the exact command that would run, and any unmet dependencies. Useful for catching shell-PATH vs launchd-PATH mismatches.
 
 ```bash
-# 2. Real run, no jitter, ignores pause + min-gap guard
+# 2. Real run, no jitter, ignores active/paused/min-gap guards
 lipost-bot run
 ```
 
@@ -186,7 +194,14 @@ If you don't want the test post live, delete it:
 lipost delete <urn>
 ```
 
-After this works once, you're done. The launch agent fires daily at `baseline_hour` and Claude does the rest. `lipost-bot status` is the one-stop check.
+When you're confident, **arm the bot** so the daily schedule actually publishes:
+
+```bash
+lipost-bot config active true
+lipost-bot status                 # confirm: active: True
+```
+
+Until you flip `active` to `true`, the launch agent will fire on schedule but every run will skip. After arming, the launch agent fires daily at `baseline_hour` and Claude does the rest. `lipost-bot status` is the one-stop check.
 
 ---
 
@@ -207,11 +222,17 @@ lipost-bot logs -f             # tail what's happening
 
 | You want to… | Run |
 | --- | --- |
-| Pause for a few days, easy resume | `lipost-bot pause` |
+| Disarm — bot stays loaded but won't publish on schedule | `lipost-bot config active false` (durable, persists across reboots) |
+| Pause transiently for a few days, easy resume | `lipost-bot pause` |
 | Stop posting *right now* without commands | `: > prompt.md` (truncate to zero bytes — `_cron` skips) |
 | Take it off the schedule completely | `lipost-bot stop` |
 | Remove the install but keep config + history | `lipost-bot uninstall` |
 | Nuclear: remove everything | `lipost-bot uninstall && rm -rf ~/.config/lipost-bot ~/Library/Logs/lipost-bot.log ~/code/lipost-bot/images` |
+
+**`active` vs `paused` vs `stop`:** all three prevent posts, but they're at different layers and feel different.
+- `active=false` is the master switch in `config.json`. Use it for "I'm not ready for this to be running yet" or "take it offline indefinitely." Doesn't touch launchd.
+- `paused=true` is in `state.json`. Use it for short tactical pauses (vacation, conference week). Same effect, but a different verb makes the intent clearer in your shell history.
+- `stop` unloads the launch agent entirely. Use it when you want the bot off the system, not just dormant.
 
 ---
 
@@ -220,7 +241,7 @@ lipost-bot logs -f             # tail what's happening
 | Command | What it does |
 | --- | --- |
 | `init [--force]` | Interactive setup. `--force` skips the dependency preflight. |
-| `status` | Single-screen overview: deps OK?, launchd loaded?, paused?, last run, next window, posts in last 7d, images pending, full config. |
+| `status` | Single-screen overview: active?, deps OK?, launchd loaded?, paused?, last run, next window, posts in last 7d, images pending, full config. |
 | `config` | Print all settings. |
 | `config <key>` | Print one key. |
 | `config <key> <value>` | Update one key (validated). Auto-reloads launchd if `baseline_hour` changes. |
@@ -228,7 +249,7 @@ lipost-bot logs -f             # tail what's happening
 | `resume` | Clear `paused`. |
 | `start` | `launchctl load -w` the plist. |
 | `stop` | `launchctl unload` the plist. The bot is fully off the schedule. |
-| `run` | Fire `_cron` immediately, no jitter, ignoring pause + min-gap guard. For testing. |
+| `run` | Fire `_cron` immediately, no jitter, ignoring `active` + `paused` + min-gap guards. For testing — works even when the bot is disarmed. |
 | `run --no-fire` | Print the resolved plan (cwd, claude/lipost paths, PATH, prompt, image mode, full command, deps) without invoking Claude. |
 | `next` | Print the next scheduled window. |
 | `prompt` | Open `prompt.md` in `$EDITOR` (defaults to `vi`). |
@@ -238,7 +259,7 @@ lipost-bot logs -f             # tail what's happening
 | `logs [-n N] [-f]` | Tail the log. `-f` follows. |
 | `uninstall` | Unload launchd, remove plist + PATH symlinks. **Keeps** `~/.config/lipost-bot/` (config + history). |
 
-`lipost-bot _cron` is the internal entry point launchd calls. You don't normally run it by hand, but it's useful for testing the pause / min-gap paths (`run` ignores both; `_cron` honors them).
+`lipost-bot _cron` is the internal entry point launchd calls. You don't normally run it by hand, but it's useful for testing the `active` / `paused` / min-gap paths (`run` ignores all three; `_cron` honors them all).
 
 ---
 
@@ -263,30 +284,36 @@ lipost-bot logs -f             # tail what's happening
 The Step-4 walkthrough is the recommended path. If you want to exercise the safety paths explicitly:
 
 ```bash
-# 1. Pause path — `run` ignores pause, so use `_cron`:
+# 1. Inactive path — `run` ignores active, so use `_cron`:
+lipost-bot config active false
+lipost-bot _cron        # logs "inactive (config.active=false) — skipping run"
+tail -3 ~/Library/Logs/lipost-bot.log
+lipost-bot config active true
+
+# 2. Pause path — `run` ignores pause, so use `_cron`:
 lipost-bot pause
 lipost-bot _cron        # logs "paused — skipping run"
 tail -3 ~/Library/Logs/lipost-bot.log
 lipost-bot resume
 
-# 2. Min-gap path — fire once, then `_cron` again:
+# 3. Min-gap path — fire once, then `_cron` again:
 lipost-bot run          # records last_run_at
 lipost-bot _cron        # logs "only X.Xh since last run … skipping"
 
-# 3. Empty-prompt path:
+# 4. Empty-prompt path:
 mv prompt.md prompt.md.bak
 lipost-bot _cron        # logs "prompt file missing"
 mv prompt.md.bak prompt.md
 
-# 4. Template-marker path:
+# 5. Template-marker path:
 # (default state right after init — `_cron` logs "still the template")
 
-# 5. Missing-image path (with image-mode prompt + empty pending dir):
+# 6. Missing-image path (with image-mode prompt + empty pending dir):
 mv images/pending/* /tmp/   # if any
 lipost-bot _cron            # logs "prompt requires {{IMAGE_PATH}} but ... is empty"
 mv /tmp/<file> images/pending/
 
-# 6. Dry-run-only Claude run (Claude executes, doesn't actually post):
+# 7. Dry-run-only Claude run (Claude executes, doesn't actually post):
 echo 'Run `lipost post --dry-run "test"` and report the JSON. Do not publish.' > prompt.md
 lipost-bot run
 tail -n 50 ~/Library/Logs/lipost-bot.log

@@ -44,6 +44,7 @@ LIPOST_CONFIG = HOME / ".config" / "linkedin-cli" / "config.json"
 LIPOST_TOKEN = HOME / ".config" / "linkedin-cli" / "token.json"
 
 DEFAULT_CONFIG = {
+    "active": False,                 # master arm switch; init writes False, user flips manually
     "baseline_hour": 9,
     "jitter_max_secs": 43200,        # 12h → run window 09:00–21:00
     "min_hours_between_runs": 20,
@@ -191,8 +192,14 @@ def cmd_init(args: argparse.Namespace) -> None:
     cfg["min_hours_between_runs"] = ask("Minimum hours between runs", cfg["min_hours_between_runs"], int)
     cfg["permission_mode"] = ask("Claude permission mode", cfg["permission_mode"])
 
+    # Always start inert. The user must explicitly arm the bot after reviewing
+    # their prompt and staged images. Not promptable on purpose.
+    cfg["active"] = False
+
     save_json(CONFIG_FILE, cfg)
     print(f"\nWrote {CONFIG_FILE}")
+    print("\nactive=false (bot is inert). When ready, arm with:")
+    print("    lipost-bot config active true")
 
     # Create the image staging directories so they're discoverable.
     IMAGES_PENDING.mkdir(parents=True, exist_ok=True)
@@ -274,13 +281,23 @@ def cmd_config(args: argparse.Namespace) -> None:
         print(f"{args.key} = {cfg[args.key]}")
         return
 
-    # cast value to type of default
+    # cast value to type of default (booleans need special handling — bool("false") is True)
     target_type = type(DEFAULT_CONFIG[args.key])
-    try:
-        new_val = target_type(args.value)
-    except ValueError:
-        print(f"invalid value for {args.key}: expected {target_type.__name__}", file=sys.stderr)
-        sys.exit(1)
+    if target_type is bool:
+        v = args.value.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            new_val = True
+        elif v in ("false", "0", "no", "off"):
+            new_val = False
+        else:
+            print(f"invalid value for {args.key}: expected true/false", file=sys.stderr)
+            sys.exit(1)
+    else:
+        try:
+            new_val = target_type(args.value)
+        except ValueError:
+            print(f"invalid value for {args.key}: expected {target_type.__name__}", file=sys.stderr)
+            sys.exit(1)
 
     if args.key == "baseline_hour" and not (0 <= new_val <= 23):
         print("baseline_hour must be 0–23", file=sys.stderr)
@@ -314,6 +331,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     posts_7d = count_posts_since(datetime.now(timezone.utc) - timedelta(days=7))
     deps_ok, deps_problems = check_dependencies()
 
+    active = cfg.get("active", False)
+    print(f"  active:     {active}{'' if active else '  ← inert; activate with: lipost-bot config active true'}")
     print(f"  deps:       {'OK' if deps_ok else 'BROKEN — see problems below'}")
     print(f"  launchd:    {'loaded' if loaded else 'NOT loaded (run: lipost-bot start)'}")
     print(f"  paused:     {state.get('paused', False)}")
@@ -447,6 +466,8 @@ def _print_dry_plan() -> None:
     print("=== lipost-bot run --no-fire ===\n")
     print(f"would skip due to: ", end="")
     reasons = []
+    if not cfg.get("active", False):
+        reasons.append("inactive (config.active=false)")
     if state.get("paused"):
         reasons.append("paused")
     if gap_h is not None and gap_h < cfg["min_hours_between_runs"]:
@@ -457,7 +478,7 @@ def _print_dry_plan() -> None:
         reasons.append("dependency check")
     print(", ".join(reasons) if reasons else "(nothing — would fire)")
     if reasons:
-        print("  note: `run` ignores `paused` and the min-gap guard at runtime; `_cron` (launchd) does not.")
+        print("  note: `run` ignores `active`, `paused`, and the min-gap guard at runtime; `_cron` (launchd) honors all three.")
     print()
 
     print(f"cwd:           {REPO_DIR}")
@@ -589,6 +610,10 @@ def cmd_cron(args: argparse.Namespace) -> None:
 def _do_claude_run(force: bool) -> None:
     cfg = get_config()
     state = get_state()
+
+    if not force and not cfg.get("active", False):
+        log("inactive (config.active=false) — skipping run. Activate with: lipost-bot config active true")
+        return
 
     if not force and state.get("paused"):
         log("paused — skipping run")
