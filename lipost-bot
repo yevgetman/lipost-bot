@@ -1,0 +1,567 @@
+#!/usr/bin/env python3
+"""lipost-bot — manages a launchd-driven autonomous LinkedIn poster.
+
+Single file, stdlib only. Run `lipost-bot init` first.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+HOME = Path.home()
+REPO_DIR = Path(__file__).resolve().parent
+CONFIG_DIR = HOME / ".config" / "lipost-bot"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+STATE_FILE = CONFIG_DIR / "state.json"
+POSTS_FILE = CONFIG_DIR / "posts.jsonl"
+LOG_FILE = HOME / "Library" / "Logs" / "lipost-bot.log"
+PROMPT_FILE = REPO_DIR / "prompt.md"
+LABEL = "local.lipost-bot"
+PLIST_SRC = REPO_DIR / f"{LABEL}.plist"
+PLIST_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+BIN_LINK = HOME / ".local" / "bin" / "lipost-bot"
+
+# Runtime dependency: lipost CLI (https://github.com/yevgetman/lipost)
+LIPOST_CONFIG = HOME / ".config" / "linkedin-cli" / "config.json"
+LIPOST_TOKEN = HOME / ".config" / "linkedin-cli" / "token.json"
+
+DEFAULT_CONFIG = {
+    "baseline_hour": 9,
+    "jitter_max_secs": 43200,        # 12h → run window 09:00–21:00
+    "min_hours_between_runs": 20,
+    "permission_mode": "bypassPermissions",
+}
+
+# PATH for subprocesses launched by _cron (launchd env is minimal).
+CRON_PATH = ":".join([
+    str(HOME / ".local" / "bin"),
+    str(HOME / ".bun" / "bin"),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+])
+
+URN_RE = re.compile(r"posted:\s+(urn:li:\S+)")
+
+
+# ── tiny helpers ───────────────────────────────────────────────────────────
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_json(path: Path, default: dict) -> dict:
+    if not path.exists():
+        return dict(default)
+    try:
+        return json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return dict(default)
+
+
+def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    os.chmod(path, 0o600)
+
+
+def get_config() -> dict:
+    return {**DEFAULT_CONFIG, **load_json(CONFIG_FILE, {})}
+
+
+def get_state() -> dict:
+    return load_json(STATE_FILE, {"last_run_at": None, "paused": False})
+
+
+def log(msg: str) -> None:
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+    with LOG_FILE.open("a") as f:
+        f.write(line)
+
+
+def check_dependencies() -> tuple[bool, list[str]]:
+    """Verify all runtime dependencies. Returns (ok, list_of_problems)."""
+    problems: list[str] = []
+    if shutil.which("claude", path=CRON_PATH) is None:
+        problems.append(
+            "`claude` (Claude Code CLI) not found on PATH. Install from "
+            "https://docs.claude.com/en/docs/claude-code"
+        )
+    if shutil.which("lipost", path=CRON_PATH) is None:
+        problems.append(
+            "`lipost` not found on PATH. Install from https://github.com/yevgetman/lipost "
+            "(`./lipost init` symlinks it onto your PATH)."
+        )
+    if not LIPOST_CONFIG.exists():
+        problems.append(f"missing {LIPOST_CONFIG} — run `lipost init` to write LinkedIn credentials.")
+    if not LIPOST_TOKEN.exists():
+        problems.append(f"missing {LIPOST_TOKEN} — run `lipost auth` to OAuth into LinkedIn.")
+    return (not problems, problems)
+
+
+def launchctl_loaded() -> bool:
+    r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
+    return any(line.split("\t")[-1] == LABEL for line in r.stdout.splitlines())
+
+
+def parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def hours_since(dt: datetime | None) -> float | None:
+    if dt is None:
+        return None
+    return (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+
+
+def fmt_local(dt: datetime) -> str:
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+
+# ── subcommands ────────────────────────────────────────────────────────────
+
+def cmd_init(args: argparse.Namespace) -> None:
+    ok, problems = check_dependencies()
+    if not ok:
+        print("lipost-bot has unmet dependencies:\n", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        print("\nFix these and re-run `lipost-bot init`. (Pass --force to skip this check.)", file=sys.stderr)
+        if not getattr(args, "force", False):
+            sys.exit(1)
+        print("(--force given; continuing anyway.)\n", file=sys.stderr)
+
+    cfg = get_config()
+    print("lipost-bot init — press enter to keep current/default values.\n")
+
+    def ask(prompt: str, current, cast=str):
+        s = input(f"{prompt} [{current}]: ").strip()
+        return cast(s) if s else current
+
+    cfg["baseline_hour"] = ask("Baseline hour (0–23, when launchd fires before jitter)", cfg["baseline_hour"], int)
+    jitter_h = ask("Jitter window in hours (max delay after baseline)", cfg["jitter_max_secs"] // 3600, int)
+    cfg["jitter_max_secs"] = jitter_h * 3600
+    cfg["min_hours_between_runs"] = ask("Minimum hours between runs", cfg["min_hours_between_runs"], int)
+    cfg["permission_mode"] = ask("Claude permission mode", cfg["permission_mode"])
+
+    save_json(CONFIG_FILE, cfg)
+    print(f"\nWrote {CONFIG_FILE}")
+
+    # symlink binary onto PATH
+    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if BIN_LINK.is_symlink() or BIN_LINK.exists():
+        BIN_LINK.unlink()
+    BIN_LINK.symlink_to(Path(__file__).resolve())
+    print(f"Symlinked {BIN_LINK} → {Path(__file__).resolve()}")
+
+    # write/refresh plist with current baseline_hour and load it
+    write_plist(cfg)
+    PLIST_DEST.parent.mkdir(parents=True, exist_ok=True)
+    if PLIST_DEST.is_symlink() or PLIST_DEST.exists():
+        PLIST_DEST.unlink()
+    PLIST_DEST.symlink_to(PLIST_SRC)
+
+    subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
+    r = subprocess.run(["launchctl", "load", "-w", str(PLIST_DEST)], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"launchctl load failed: {r.stderr}", file=sys.stderr)
+    else:
+        print(f"Loaded launchd job {LABEL} (baseline {cfg['baseline_hour']:02d}:00, jitter ≤ {jitter_h}h)")
+
+    if not PROMPT_FILE.exists() or PROMPT_FILE.stat().st_size == 0:
+        print(f"\nReminder: {PROMPT_FILE} is empty — bot will skip runs until you write instructions there.")
+
+
+def write_plist(cfg: dict) -> None:
+    """Regenerate the plist from config (so baseline_hour edits propagate)."""
+    program = str((REPO_DIR / "lipost-bot").resolve())
+    plist = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{program}</string>
+        <string>_cron</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{int(cfg["baseline_hour"])}</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{LOG_FILE}</string>
+    <key>StandardErrorPath</key>
+    <string>{LOG_FILE}</string>
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
+'''
+    PLIST_SRC.write_text(plist)
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    cfg = get_config()
+    if not args.key:
+        for k, v in cfg.items():
+            print(f"{k} = {v}")
+        return
+
+    if args.key not in DEFAULT_CONFIG:
+        print(f"unknown key: {args.key}", file=sys.stderr)
+        print(f"valid keys: {', '.join(DEFAULT_CONFIG)}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.value is None:
+        print(f"{args.key} = {cfg[args.key]}")
+        return
+
+    # cast value to type of default
+    target_type = type(DEFAULT_CONFIG[args.key])
+    try:
+        new_val = target_type(args.value)
+    except ValueError:
+        print(f"invalid value for {args.key}: expected {target_type.__name__}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.key == "baseline_hour" and not (0 <= new_val <= 23):
+        print("baseline_hour must be 0–23", file=sys.stderr)
+        sys.exit(1)
+    if args.key == "jitter_max_secs" and new_val < 0:
+        print("jitter_max_secs must be ≥ 0", file=sys.stderr)
+        sys.exit(1)
+
+    cfg[args.key] = new_val
+    save_json(CONFIG_FILE, cfg)
+    print(f"set {args.key} = {new_val}")
+
+    if args.key == "baseline_hour":
+        write_plist(cfg)
+        if launchctl_loaded():
+            subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
+            subprocess.run(["launchctl", "load", "-w", str(PLIST_DEST)], capture_output=True)
+            print(f"reloaded launchd job (new baseline {new_val:02d}:00)")
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    cfg = get_config()
+    state = get_state()
+    loaded = launchctl_loaded()
+
+    last = parse_iso(state.get("last_run_at"))
+    last_str = fmt_local(last) if last else "never"
+    last_ago = hours_since(last)
+    last_ago_str = f" ({last_ago:.1f}h ago)" if last_ago is not None else ""
+
+    posts_7d = count_posts_since(datetime.now(timezone.utc) - timedelta(days=7))
+    deps_ok, deps_problems = check_dependencies()
+
+    print(f"  deps:       {'OK' if deps_ok else 'BROKEN — see problems below'}")
+    print(f"  launchd:    {'loaded' if loaded else 'NOT loaded (run: lipost-bot start)'}")
+    print(f"  paused:     {state.get('paused', False)}")
+    print(f"  last run:   {last_str}{last_ago_str}")
+    print(f"  posts (7d): {posts_7d}")
+    print(f"  next:       {next_window_str(cfg, last)}")
+    print(f"  prompt:     {'empty (will skip)' if not _prompt_has_content() else 'set'}")
+    print(f"  config:     baseline_hour={cfg['baseline_hour']}, jitter≤{cfg['jitter_max_secs']//3600}h, "
+          f"min_gap={cfg['min_hours_between_runs']}h, mode={cfg['permission_mode']}")
+
+    if not deps_ok:
+        print("\n  dependency problems:")
+        for p in deps_problems:
+            print(f"    - {p}")
+
+
+def _prompt_has_content() -> bool:
+    if not PROMPT_FILE.exists():
+        return False
+    text = PROMPT_FILE.read_text().strip()
+    # treat the stub as empty
+    return bool(text) and "(Empty —" not in text
+
+
+def next_window_str(cfg: dict, last: datetime | None) -> str:
+    now = datetime.now().astimezone()
+    today_baseline = now.replace(hour=cfg["baseline_hour"], minute=0, second=0, microsecond=0)
+    jitter_h = cfg["jitter_max_secs"] / 3600
+
+    # if today's window already passed (end < now) or we already ran today after baseline → tomorrow
+    today_end = today_baseline + timedelta(seconds=cfg["jitter_max_secs"])
+    if now > today_end or (last and last >= today_baseline.astimezone(timezone.utc)):
+        base = today_baseline + timedelta(days=1)
+    else:
+        base = today_baseline
+
+    end = base + timedelta(seconds=cfg["jitter_max_secs"])
+    return f"{base.strftime('%Y-%m-%d %H:%M')} – {end.strftime('%H:%M')} (window {jitter_h:g}h)"
+
+
+def count_posts_since(cutoff: datetime) -> int:
+    if not POSTS_FILE.exists():
+        return 0
+    n = 0
+    for line in POSTS_FILE.read_text().splitlines():
+        try:
+            entry = json.loads(line)
+            t = parse_iso(entry.get("posted_at"))
+            if t and t >= cutoff:
+                n += 1
+        except json.JSONDecodeError:
+            continue
+    return n
+
+
+def cmd_pause(args: argparse.Namespace) -> None:
+    state = get_state()
+    state["paused"] = True
+    save_json(STATE_FILE, state)
+    print("paused. resume with: lipost-bot resume")
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    state = get_state()
+    state["paused"] = False
+    save_json(STATE_FILE, state)
+    print("resumed.")
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    if launchctl_loaded():
+        print("already loaded.")
+        return
+    r = subprocess.run(["launchctl", "load", "-w", str(PLIST_DEST)], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"failed: {r.stderr}", file=sys.stderr)
+        sys.exit(1)
+    print(f"loaded {LABEL}")
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    if not launchctl_loaded():
+        print("not loaded.")
+        return
+    subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
+    print(f"unloaded {LABEL}")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Fire immediately: no jitter, ignore pause and min-gap guard."""
+    print("running now (no jitter, ignoring pause and gap guard)...")
+    _do_claude_run(force=True)
+
+
+def cmd_posts(args: argparse.Namespace) -> None:
+    if not POSTS_FILE.exists():
+        print("no posts yet.")
+        return
+    entries = []
+    for line in POSTS_FILE.read_text().splitlines():
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    entries.reverse()  # newest first
+    if args.limit:
+        entries = entries[:args.limit]
+
+    if args.open and entries:
+        urn = entries[0]["urn"]
+        url = f"https://www.linkedin.com/feed/update/{urn}/"
+        subprocess.run(["open", url])
+        print(f"opened {url}")
+        return
+
+    if not entries:
+        print("no posts yet.")
+        return
+    for e in entries:
+        when = parse_iso(e.get("posted_at"))
+        when_str = fmt_local(when) if when else "?"
+        print(f"  {when_str}  {e['urn']}")
+    print(f"\n({len(entries)} shown; full history at {POSTS_FILE})")
+
+
+def cmd_next(args: argparse.Namespace) -> None:
+    cfg = get_config()
+    state = get_state()
+    last = parse_iso(state.get("last_run_at"))
+    print(next_window_str(cfg, last))
+
+
+def cmd_prompt(args: argparse.Namespace) -> None:
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, str(PROMPT_FILE)])
+
+
+def cmd_logs(args: argparse.Namespace) -> None:
+    if not LOG_FILE.exists():
+        print(f"no log file at {LOG_FILE}")
+        return
+    if args.follow:
+        os.execvp("tail", ["tail", "-n", str(args.lines), "-f", str(LOG_FILE)])
+    else:
+        os.execvp("tail", ["tail", "-n", str(args.lines), str(LOG_FILE)])
+
+
+def cmd_uninstall(args: argparse.Namespace) -> None:
+    if launchctl_loaded():
+        subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
+        print(f"unloaded {LABEL}")
+    if PLIST_DEST.is_symlink() or PLIST_DEST.exists():
+        PLIST_DEST.unlink()
+        print(f"removed {PLIST_DEST}")
+    if BIN_LINK.is_symlink():
+        BIN_LINK.unlink()
+        print(f"removed {BIN_LINK}")
+    print(f"\nKept: {CONFIG_DIR} (config + history). Delete by hand if you want a clean slate.")
+
+
+# ── _cron: the launchd entry point ─────────────────────────────────────────
+
+def cmd_cron(args: argparse.Namespace) -> None:
+    _do_claude_run(force=False)
+
+
+def _do_claude_run(force: bool) -> None:
+    cfg = get_config()
+    state = get_state()
+
+    if not force and state.get("paused"):
+        log("paused — skipping run")
+        return
+
+    last = parse_iso(state.get("last_run_at"))
+    if not force and last is not None:
+        gap_h = hours_since(last)
+        if gap_h is not None and gap_h < cfg["min_hours_between_runs"]:
+            log(f"only {gap_h:.1f}h since last run (min {cfg['min_hours_between_runs']}h) — skipping")
+            return
+
+    if not _prompt_has_content():
+        log(f"prompt file empty: {PROMPT_FILE} — skipping run")
+        return
+
+    ok, problems = check_dependencies()
+    if not ok:
+        for p in problems:
+            log(f"dependency check failed: {p}")
+        log("skipping run (run `lipost-bot status` for details)")
+        return
+
+    if not force:
+        jitter = random.randint(0, cfg["jitter_max_secs"])
+        log(f"fired; sleeping {jitter}s (~{jitter//3600}h {jitter%3600//60}m)")
+        time.sleep(jitter)
+
+    # Mark last_run_at *before* invoking claude — prevents double-fire if claude crashes
+    state["last_run_at"] = now_iso()
+    save_json(STATE_FILE, state)
+
+    claude_path = shutil.which("claude", path=CRON_PATH) or "claude"
+    prompt_text = PROMPT_FILE.read_text()
+    log(f"starting claude ({claude_path})")
+
+    env = {**os.environ, "PATH": CRON_PATH}
+    try:
+        proc = subprocess.run(
+            [claude_path, "-p", prompt_text, "--permission-mode", cfg["permission_mode"]],
+            cwd=str(REPO_DIR),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30 * 60,  # 30-min hard cap
+        )
+    except subprocess.TimeoutExpired as e:
+        log(f"claude timed out after 30m; partial output: {(e.stdout or '')[-500:]}")
+        return
+
+    # Append claude's output to the log
+    with LOG_FILE.open("a") as f:
+        if proc.stdout:
+            f.write(proc.stdout)
+            if not proc.stdout.endswith("\n"):
+                f.write("\n")
+        if proc.stderr:
+            f.write("[stderr] " + proc.stderr.replace("\n", "\n[stderr] ") + "\n")
+
+    log(f"claude exited rc={proc.returncode}")
+
+    # Parse URNs from output and append to posts.jsonl
+    for m in URN_RE.finditer(proc.stdout or ""):
+        entry = {
+            "urn": m.group(1),
+            "posted_at": now_iso(),
+            "exit_code": proc.returncode,
+        }
+        POSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with POSTS_FILE.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        log(f"recorded post {entry['urn']}")
+
+
+# ── arg parsing ────────────────────────────────────────────────────────────
+
+def main() -> None:
+    p = argparse.ArgumentParser(prog="lipost-bot", description="Manage the autonomous LinkedIn poster.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_init = sub.add_parser("init", help="interactive setup: write config, symlink binary, install + load launchd job")
+    p_init.add_argument("--force", action="store_true", help="skip the lipost dependency check")
+    p_init.set_defaults(func=cmd_init)
+
+    p_cfg = sub.add_parser("config", help="show or update settings (baseline_hour, jitter_max_secs, min_hours_between_runs, permission_mode)")
+    p_cfg.add_argument("key", nargs="?")
+    p_cfg.add_argument("value", nargs="?")
+    p_cfg.set_defaults(func=cmd_config)
+
+    sub.add_parser("status", help="show launchd / pause / last-run / next-window / posts-7d").set_defaults(func=cmd_status)
+    sub.add_parser("pause", help="skip runs without unloading launchd").set_defaults(func=cmd_pause)
+    sub.add_parser("resume", help="undo pause").set_defaults(func=cmd_resume)
+    sub.add_parser("start", help="load the launchd job").set_defaults(func=cmd_start)
+    sub.add_parser("stop", help="unload the launchd job").set_defaults(func=cmd_stop)
+    sub.add_parser("run", help="fire claude immediately (no jitter, ignores pause + gap)").set_defaults(func=cmd_run)
+    sub.add_parser("next", help="print the next scheduled window").set_defaults(func=cmd_next)
+    sub.add_parser("prompt", help=f"open {PROMPT_FILE.name} in $EDITOR").set_defaults(func=cmd_prompt)
+
+    p_posts = sub.add_parser("posts", help="list past posts")
+    p_posts.add_argument("--limit", type=int, default=20)
+    p_posts.add_argument("--open", action="store_true", help="open the most recent post in browser")
+    p_posts.set_defaults(func=cmd_posts)
+
+    p_logs = sub.add_parser("logs", help="show recent log lines")
+    p_logs.add_argument("-f", "--follow", action="store_true")
+    p_logs.add_argument("-n", "--lines", type=int, default=50)
+    p_logs.set_defaults(func=cmd_logs)
+
+    sub.add_parser("uninstall", help="remove launchd job + PATH symlink (keeps config + history)").set_defaults(func=cmd_uninstall)
+
+    p_cron = sub.add_parser("_cron", help=argparse.SUPPRESS)
+    p_cron.set_defaults(func=cmd_cron)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
