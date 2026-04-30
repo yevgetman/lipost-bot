@@ -36,7 +36,7 @@ BIN_LINK = HOME / ".local" / "bin" / "lipost-bot"
 IMAGES_DIR = REPO_DIR / "images"
 IMAGES_PENDING = IMAGES_DIR / "pending"
 IMAGES_USED = IMAGES_DIR / "used"
-IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif"}
 IMAGE_PLACEHOLDER = "{{IMAGE_PATH}}"
 
 # Runtime dependency: lipost CLI (https://github.com/yevgetman/lipost)

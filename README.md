@@ -138,7 +138,7 @@ When `prompt.md` contains the placeholder `{{IMAGE_PATH}}`:
 - After a successful post, the image is moved to `images/used/<YYYYMMDDTHHMMSS>_<filename>` so it's never reused.
 - If the placeholder is present but `images/pending/` is empty, the run is skipped with `prompt requires {{IMAGE_PATH}} but ... is empty`.
 
-Drop your staged JPEG/PNG files into `~/code/lipost-bot/images/pending/`. List with `lipost-bot images`.
+Drop your staged JPEG, PNG, or GIF files into `~/code/lipost-bot/images/pending/`. List with `lipost-bot images`. Animated GIFs upload as-is and generally animate in LinkedIn's feed renderer; Claude only sees a representative frame when reading the file, so the example prompt instructs it to caption the image without assuming a still scene.
 
 ### Text-only prompts
 
