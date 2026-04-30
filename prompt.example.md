@@ -25,11 +25,12 @@ Or, if you can't honestly write a caption (image is unclear, off-domain, sensiti
 ```
 
 Voice rules for the caption:
-- Lowercase first word of sentences; normal capitalization for proper nouns and acronyms.
 - Concrete > abstract. Specific > vague.
 - Banned phrases: "excited to share", "thrilled to announce", "humbled", "proud to", "game-changer", "in today's fast-paced world", "what are your thoughts?", "agree?", "thoughts?".
-- No hashtags. No emojis unless the image genuinely calls for one.
+- No hashtags.
 - Don't open with "I". Don't open with a question. Don't end with a call to engage.
+
+(Capitalization, punctuation, paragraph breaks, and emoji policy live in the style layer that's appended below — defer to it.)
 
 Length: 2–4 sentences. If you can say it in 2, do.
 

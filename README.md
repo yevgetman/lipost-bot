@@ -12,7 +12,7 @@ A tiny launchd-driven autonomous LinkedIn poster with a human-in-the-loop approv
 
 Three phases, each triggered separately:
 
-**Phase 1 — Generate** (`lipost-bot generate`, manual). Drains everything in `images/pending/`. For each image, runs Claude Code with your `prompt.md`. Claude reads the image and outputs a JSON object with a caption + alt text. Each `(image, caption, alt)` is saved as a draft directory under `drafts/<slug>/` with status `pending_approval`. Images Claude SKIPs are moved to `images/skipped/` with the reason recorded.
+**Phase 1 — Generate** (`lipost-bot generate`, manual). Drains everything in `images/pending/`. For each image, runs Claude Code with your `prompt.md` plus the **style layer** (`style.md` + your optional `user_style.md`) auto-appended. Claude reads the image and outputs a JSON object with a caption + alt text. Each `(image, caption, alt)` is saved as a draft directory under `drafts/<slug>/` with status `pending_approval`. Images Claude SKIPs are moved to `images/skipped/` with the reason recorded.
 
 **Phase 2 — Review** (`lipost-bot review`, manual). Walks pending drafts. For each one: prints the image path, caption, and alt in the terminal, then prompts `[a]pprove / [r]eject / [e]dit / [g]enerate-again / [s]kip / [q]uit`. `e` opens caption + alt in `$EDITOR` for manual revision. `g` re-invokes Claude with optional feedback (e.g. "make it shorter", "less corporate") plus the previous draft as context, then re-renders so you can iterate. Approved drafts move to status `approved` and join the posting queue. (Open the image yourself — `open <path>` shown in the TUI — if you want a visual reference.)
 
@@ -149,9 +149,14 @@ If parsing fails (no valid JSON in the output), `generate` logs the failure for 
 - The `{{IMAGE_PATH}}` placeholder (substituted at run time).
 - An instruction to **read the image** (Claude's Read tool accepts JPEG/PNG/GIF; for GIFs it sees a representative frame).
 - A `SKIP` clause: tell Claude what conditions warrant `{"skip": true, ...}` — image off-domain, ambiguous, repetitive.
-- Tone, topic, length, hashtag, emoji constraints — explicit. Claude defaults to LinkedIn-cliché slop without them.
-- Banned phrases ("excited to share", "thrilled to announce", "what are your thoughts?", etc).
+- **Voice and content constraints**: tone, topic, length, what NOT to write about, banned phrases ("excited to share", "thrilled to announce", "what are your thoughts?", etc.), opening/closing rules. Claude defaults to LinkedIn-cliché slop without explicit guidance.
 - An explicit instruction to **output ONLY the JSON** — no explanation, no code fence.
+
+### What does NOT belong in the prompt
+
+The style layer (`style.md` + `user_style.md`) is auto-appended to every generate-time prompt. It already covers all the **mechanical formatting rules** — capitalization, punctuation, dashes, smart vs straight quotes, paragraph breaks, whitespace, ASCII vs Unicode, markdown, length caps, emoji policy, alt-text conventions. **Don't duplicate these in `prompt.md`** — and avoid contradicting them, since the style layer is appended after the prompt body and Claude treats it as authoritative for mechanics.
+
+If you want to change a mechanical rule (e.g. "always use lowercase first word"), edit the style layer (`lipost-bot style` for your additions, or PR against `style.md` for app-wide changes), not the prompt.
 
 The shipped `prompt.example.md` is a generic starter; `prompt.md` is the live file. They have the same shape.
 
@@ -170,6 +175,10 @@ lipost-bot images
 
 # 3. Edit the prompt — and DELETE the TEMPLATE marker on line 1 when ready
 lipost-bot prompt
+
+# 3b. (Optional) Add personal formatting tweaks to the style layer
+lipost-bot style              # opens user_style.md in $EDITOR
+lipost-bot style --show       # preview the combined layer that gets injected
 
 # 4. Drain the pending dir into drafts (this calls Claude once per image)
 lipost-bot generate
@@ -215,12 +224,21 @@ After step 9, the launch agent fires daily at `baseline_hour`, sleeps the jitter
 lipost-bot status              # everything in one screen
 lipost-bot drafts              # queue grouped by status
 lipost-bot drafts --status approved   # just the queue waiting to post
+lipost-bot images              # what's staged in pending/ (and any skipped)
+lipost-bot images --open       # open pending dir in Finder
 lipost-bot generate            # whenever you've staged new images
 lipost-bot review              # whenever there are pending drafts
+lipost-bot prompt              # edit prompt.md (voice, content, JSON shape)
+lipost-bot style               # edit user_style.md (your formatting tweaks)
+lipost-bot style --show        # preview the full style layer Claude will see
 lipost-bot pause / resume      # transient pause without unloading launchd
 lipost-bot stop / start        # off / on the schedule
+lipost-bot run --no-fire       # inspect the next post without publishing
+lipost-bot run                 # post the next approved draft now (test or manual)
+lipost-bot next                # next scheduled fire window
 lipost-bot logs -f             # tail live activity
-lipost-bot posts               # post history (URN + caption ref)
+lipost-bot posts               # post history (URN + image)
+lipost-bot posts --open        # open the most recent post on LinkedIn
 ```
 
 ### Kill switches (in order of severity)
