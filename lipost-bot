@@ -884,10 +884,6 @@ def _review_one(draft: dict, i: int, total: int) -> str:
         print(f"  {meta.get('alt_text', '')}")
         print()
 
-        if draft["image_path"] and draft["image_path"].exists():
-            subprocess.Popen(["open", "-a", "Preview", str(draft["image_path"])],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
         choice = input("[a]pprove  [r]eject  [e]dit  [g]enerate-again  [s]kip  [q]uit > ").strip().lower()
         if choice in ("a", "approve"):
             update_draft(draft["slug"], status="approved", approved_at=now_iso())
