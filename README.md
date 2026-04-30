@@ -164,8 +164,17 @@ lipost-bot generate
 
 # 5. Review each draft in the TUI
 lipost-bot review
-# For each: image opens in Preview, caption + alt show in terminal.
-# Press a/r/e/s/q. `e` opens caption+alt in $EDITOR.
+# For each: image path + caption + alt show in terminal.
+# Press a/r/e/g/s/q.
+#   a — approve
+#   r — reject
+#   e — edit caption + alt in $EDITOR
+#   g — ask Claude to rewrite (prompts for optional feedback like
+#       "make it shorter" or "lead with the failure mode"); re-renders
+#       so you can iterate. Press 'g' again with different feedback,
+#       or 'a' once you're happy.
+#   s — skip (leave as pending_approval)
+#   q — quit (remaining drafts stay pending_approval)
 
 # 6. Verify state — `drafts: approved=N` should be > 0
 lipost-bot status
