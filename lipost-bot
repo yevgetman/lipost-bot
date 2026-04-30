@@ -266,6 +266,30 @@ def check_dependencies() -> tuple[bool, list[str]]:
     return (not problems, problems)
 
 
+def check_claude_auth(cfg: dict) -> tuple[bool, str]:
+    """Smoke-test `claude -p` to catch the case where the binary is on PATH but
+    the user isn't logged in (or the configured model isn't available). Returns
+    (ok, error_message). Costs a handful of tokens on the configured model."""
+    claude_path = shutil.which("claude", path=CRON_PATH) or shutil.which("claude")
+    if not claude_path:
+        return False, "claude binary not found on PATH"
+    try:
+        proc = subprocess.run(
+            [claude_path, "-p", "respond with the single word: ok",
+             "--permission-mode", cfg["permission_mode"],
+             "--model", cfg["claude_model"]],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "claude smoke test timed out after 60s"
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip()
+        if not msg:
+            msg = f"rc={proc.returncode} (no output)"
+        return False, msg[:500]
+    return True, "ok"
+
+
 def launchctl_loaded(label: str = LABEL) -> bool:
     r = subprocess.run(["launchctl", "list"], capture_output=True, text=True)
     return any(line.split("\t")[-1] == label for line in r.stdout.splitlines())
@@ -972,6 +996,13 @@ def cmd_generate(args: argparse.Namespace) -> None:
         print(f"drop JPEG/PNG/GIF files there or open with: lipost-bot images --open")
         return
 
+    print(f"checking claude auth ({cfg['claude_model']})...", flush=True)
+    auth_ok, auth_msg = check_claude_auth(cfg)
+    if not auth_ok:
+        print(f"claude smoke test failed: {auth_msg}", file=sys.stderr)
+        print(f"likely fixes: run `claude /login` in this shell, or set ANTHROPIC_API_KEY.", file=sys.stderr)
+        sys.exit(1)
+
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"generating drafts for {len(pending)} image(s) using {cfg['claude_model']}...")
@@ -1267,6 +1298,12 @@ def _do_generate_cron() -> None:
     pending = list_pending_images()
     if not pending:
         log("[generate-cron] no images in pending — skipping")
+        return
+
+    auth_ok, auth_msg = check_claude_auth(cfg)
+    if not auth_ok:
+        log(f"[generate-cron] claude smoke test failed: {auth_msg} — skipping. "
+            f"Run `claude /login` or set ANTHROPIC_API_KEY in the launchd env.")
         return
 
     DRAFTS_DIR.mkdir(parents=True, exist_ok=True)
