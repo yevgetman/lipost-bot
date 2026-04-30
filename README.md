@@ -45,7 +45,7 @@ cp prompt.example.md prompt.md
 $EDITOR prompt.md
 ```
 
-The bot skips the run if `prompt.md` is missing, empty, or still contains the `(Empty —…)` stub. So it's safe to leave `prompt.md` blank until you're ready.
+`prompt.example.md` is a working starter template. **It includes a `<!-- TEMPLATE: … -->` marker on line 1 that the bot recognizes — while that line is present, `_cron` will refuse to run and log `prompt is still the template (remove the TEMPLATE marker line)`.** Edit the prompt to your liking and **delete the marker line** when you're ready to go live. The bot also skips when `prompt.md` is missing or empty.
 
 ## Usage
 

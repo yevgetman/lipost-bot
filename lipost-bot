@@ -283,7 +283,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"  last run:   {last_str}{last_ago_str}")
     print(f"  posts (7d): {posts_7d}")
     print(f"  next:       {next_window_str(cfg, last)}")
-    print(f"  prompt:     {'empty (will skip)' if not _prompt_has_content() else 'set'}")
+    prompt_state = _prompt_state()
+    prompt_label = {
+        "missing":  "missing (will skip)",
+        "empty":    "empty (will skip)",
+        "template": "template — edit before going live (will skip)",
+        "ready":    "ready",
+    }[prompt_state]
+    print(f"  prompt:     {prompt_label}")
     print(f"  config:     baseline_hour={cfg['baseline_hour']}, jitter≤{cfg['jitter_max_secs']//3600}h, "
           f"min_gap={cfg['min_hours_between_runs']}h, mode={cfg['permission_mode']}")
 
@@ -293,12 +300,25 @@ def cmd_status(args: argparse.Namespace) -> None:
             print(f"    - {p}")
 
 
-def _prompt_has_content() -> bool:
+# If this marker is present in prompt.md, the bot treats the prompt as
+# "not customized yet" and skips runs until you remove it.
+TEMPLATE_MARKER = "<!-- TEMPLATE: lipost-bot will refuse to run while this line is present"
+
+
+def _prompt_state() -> str:
+    """One of: 'missing', 'empty', 'template', 'ready'."""
     if not PROMPT_FILE.exists():
-        return False
+        return "missing"
     text = PROMPT_FILE.read_text().strip()
-    # treat the stub as empty
-    return bool(text) and "(Empty —" not in text
+    if not text:
+        return "empty"
+    if TEMPLATE_MARKER in text:
+        return "template"
+    return "ready"
+
+
+def _prompt_has_content() -> bool:
+    return _prompt_state() == "ready"
 
 
 def next_window_str(cfg: dict, last: datetime | None) -> str:
@@ -458,8 +478,14 @@ def _do_claude_run(force: bool) -> None:
             log(f"only {gap_h:.1f}h since last run (min {cfg['min_hours_between_runs']}h) — skipping")
             return
 
-    if not _prompt_has_content():
-        log(f"prompt file empty: {PROMPT_FILE} — skipping run")
+    state = _prompt_state()
+    if state != "ready":
+        reason = {
+            "missing":  f"prompt file missing: {PROMPT_FILE}",
+            "empty":    f"prompt file empty: {PROMPT_FILE}",
+            "template": f"prompt is still the template (remove the TEMPLATE marker line): {PROMPT_FILE}",
+        }[state]
+        log(f"{reason} — skipping run")
         return
 
     ok, problems = check_dependencies()
