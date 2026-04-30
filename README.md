@@ -8,7 +8,9 @@ A tiny launchd-driven autonomous LinkedIn poster. Fires Claude Code once a day a
 
 ## What it actually does
 
-`launchd` fires the bot at a fixed "baseline" hour every day (default `09:00`). The bot then sleeps for a random `0…N` seconds (default `0…12h`), so the actual post lands somewhere inside a window — e.g. between 09:00 and 21:00 — at a different time each day. Then it runs `claude -p "$(cat prompt.md)" --permission-mode bypassPermissions` inside the repo directory. Whatever Claude does next is up to your `prompt.md`. If the prompt instructs Claude to call `lipost post …`, the bot scrapes the resulting `urn:li:share:…` from Claude's output and records it to a local history file.
+`launchd` fires the bot at a fixed "baseline" hour every day (default `09:00`). The bot then sleeps for a random `0…N` seconds (default `0…12h`), so the actual post lands somewhere inside a window — e.g. between 09:00 and 21:00 — at a different time each day. Then it runs `claude -p "$(cat prompt.md)" --permission-mode bypassPermissions --model claude-opus-4-7` inside the repo directory. Whatever Claude does next is up to your `prompt.md`. If the prompt instructs Claude to call `lipost post …`, the bot scrapes the resulting `urn:li:share:…` from Claude's output and records it to a local history file.
+
+**Image posts.** If `prompt.md` contains the placeholder `{{IMAGE_PATH}}`, the bot picks a random file from `images/pending/`, substitutes the absolute path into the prompt, and Claude reads the image and writes a caption from it. After a successful post, the image is moved to `images/used/` (timestamped) so it's never re-used. If the placeholder is present but `images/pending/` is empty, the run is skipped with a clear log line. Drop your staged images into `images/pending/` — JPEG and PNG are supported. See *Image posts* below.
 
 There's a min-hours-between-runs guard (default 20h) so accidental double-fires can't double-post, and a `pause` flag so you can take it offline without unloading the launch agent.
 
@@ -75,6 +77,7 @@ lipost-bot resume              # undo pause
 | `prompt` | Open `prompt.md` in `$EDITOR` (defaults to `vi`). |
 | `posts [--limit N]` | List recorded URNs, newest first. |
 | `posts --open` | Open the most recent recorded post in your browser. |
+| `images` | List `images/pending/` and recent `images/used/` contents. |
 | `logs [-n N] [-f]` | Tail the log. `-f` follows. |
 | `uninstall` | Unload launchd, remove plist + PATH symlinks. **Keeps** `~/.config/lipost-bot/` (config + history). |
 
@@ -90,6 +93,7 @@ lipost-bot resume              # undo pause
 | `jitter_max_secs` | `43200` | Max seconds the wrapper sleeps after baseline before invoking Claude. Default `43200` = 12h, giving a 09:00–21:00 run window. Set to `0` for a deterministic fire at exactly `baseline_hour:00`. |
 | `min_hours_between_runs` | `20` | If the previous run started less than this many hours ago, `_cron` skips. Prevents accidental double-posting. |
 | `permission_mode` | `bypassPermissions` | Passed to `claude -p` as `--permission-mode`. The bot is unattended, so it must not stop on permission prompts. |
+| `claude_model` | `claude-opus-4-7` | Passed to `claude -p` as `--model`. Use a full model id (e.g. `claude-opus-4-7`, `claude-sonnet-4-6`) or an alias (`opus`, `sonnet`). Default is Opus 4.7 because image interpretation benefits from the strongest model. |
 
 Update via `lipost-bot config <key> <value>`. Values are cast and validated.
 
@@ -99,8 +103,10 @@ Update via `lipost-bot config <key> <value>`. Values are cast and validated.
 | --- | --- |
 | `~/.config/lipost-bot/config.json` | Settings (chmod 600). |
 | `~/.config/lipost-bot/state.json` | `last_run_at` and `paused` (chmod 600). |
-| `~/.config/lipost-bot/posts.jsonl` | Append-only record: `{urn, posted_at, exit_code}` per published post. |
+| `~/.config/lipost-bot/posts.jsonl` | Append-only record: `{urn, posted_at, exit_code, image}` per published post. |
 | `~/Library/Logs/lipost-bot.log` | Wrapper logs and Claude stdout/stderr. |
+| `~/code/lipost-bot/images/pending/` | Drop staged images here for the bot to consume. |
+| `~/code/lipost-bot/images/used/` | Successfully-posted images, prefixed with a timestamp. |
 | `~/.local/bin/lipost-bot` | Symlink to the CLI for `PATH` access. |
 | `~/Library/LaunchAgents/local.lipost-bot.plist` | Symlink to the repo plist; the launch agent. |
 
@@ -115,6 +121,22 @@ The bot is dumb on purpose. All policy lives in `prompt.md`. See `prompt.example
 - **Tell Claude not to use `--dry-run`** — useful for testing, but you'll never publish if it's stuck on dry-run.
 - **Constraints on tone, topics, length, hashtags, emojis** — Claude will default to LinkedIn-cliché slop without explicit instruction.
 - **A "skip if you'd be repeating yourself" clause.** The bot can't see prior posts on its own; the URN list in `posts.jsonl` is recorded, but the prompt doesn't see it unless you choose to inject it.
+
+## Image posts
+
+The bot has a deliberately minimal image flow. You stage images, the bot picks one per run, Claude looks at it and writes a caption.
+
+**Staging.** Drop JPEG or PNG files into `~/code/lipost-bot/images/pending/`. There's no quota, no upload step — they're just files in a directory. List them any time with `lipost-bot images`.
+
+**The placeholder.** Put `{{IMAGE_PATH}}` somewhere in `prompt.md`. The bot substitutes it with an absolute path to a randomly-picked pending image at run time. The included `prompt.example.md` shows the pattern: tell Claude to read the image, write a caption, and call `lipost post --image "{{IMAGE_PATH}}" --alt "<alt text>" "<caption>"`.
+
+**Lifecycle.** When Claude posts (URN appears in output), the bot moves the image from `pending/` to `used/<timestamp>_<filename>` so it's never re-used. If Claude doesn't post (e.g. it output `SKIP`), the image stays in `pending/` for the next run. The `posts.jsonl` history records which image went with each URN.
+
+**Edge cases.**
+- Placeholder present, `pending/` empty → `_cron` logs `prompt requires {{IMAGE_PATH}} but ... is empty` and skips. Stage more images, then `lipost-bot run`.
+- Placeholder present, multiple images pending → one is chosen at random.
+- No placeholder in `prompt.md` → image-mode is off entirely; the bot ignores `images/`.
+- Want to retire an image without posting it → just `mv` it out of `images/pending/`.
 
 ## Testing
 
@@ -133,16 +155,22 @@ Recommended test sequence — safe → real:
    tail -3 ~/Library/Logs/lipost-bot.log
    lipost-bot resume
    ```
-3. **Claude runs but doesn't post.** Put a dry-run-only prompt in `prompt.md`:
+3. **Inspect the resolved plan without invoking Claude:**
+   ```bash
+   lipost-bot run --no-fire
+   ```
+   Prints cwd, claude/lipost paths, the launchd-context PATH, prompt body, image mode, the exact command that would run, and any unmet dependencies. Useful for catching shell-PATH vs launchd-PATH mismatches.
+4. **Claude runs but doesn't post.** Put a dry-run-only prompt in `prompt.md`:
    ```
    Run `lipost post --dry-run "test"` and report the JSON. Do not publish.
    ```
    Then `lipost-bot run` and `tail -f ~/Library/Logs/lipost-bot.log`.
-4. **End-to-end.** Replace the prompt with real instructions, then:
+5. **End-to-end (image post).** Drop a real image into `images/pending/`, keep the example prompt's `{{IMAGE_PATH}}` placeholder, then:
    ```bash
    lipost-bot run
-   lipost-bot posts        # the URN should appear
-   lipost-bot posts --open # opens it in browser
+   lipost-bot posts        # URN + which image was used
+   lipost-bot posts --open # see the post on LinkedIn
+   lipost-bot images       # confirm the image moved to used/
    lipost delete <urn>     # nuke the test post
    ```
 

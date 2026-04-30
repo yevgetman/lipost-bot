@@ -4,5 +4,8 @@ local.lipost-bot.plist
 # user content; commit prompt.example.md instead
 prompt.md
 
+# user image staging (created by `lipost-bot init`)
+images/
+
 # logs
 *.log

@@ -30,6 +30,15 @@ PLIST_SRC = REPO_DIR / f"{LABEL}.plist"
 PLIST_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
 BIN_LINK = HOME / ".local" / "bin" / "lipost-bot"
 
+# Image staging — the user drops files into pending/. The bot picks one per
+# run, has Claude write a caption from it, and moves it to used/ after a
+# successful post. Both dirs are auto-created.
+IMAGES_DIR = REPO_DIR / "images"
+IMAGES_PENDING = IMAGES_DIR / "pending"
+IMAGES_USED = IMAGES_DIR / "used"
+IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+IMAGE_PLACEHOLDER = "{{IMAGE_PATH}}"
+
 # Runtime dependency: lipost CLI (https://github.com/yevgetman/lipost)
 LIPOST_CONFIG = HOME / ".config" / "linkedin-cli" / "config.json"
 LIPOST_TOKEN = HOME / ".config" / "linkedin-cli" / "token.json"
@@ -39,6 +48,7 @@ DEFAULT_CONFIG = {
     "jitter_max_secs": 43200,        # 12h → run window 09:00–21:00
     "min_hours_between_runs": 20,
     "permission_mode": "bypassPermissions",
+    "claude_model": "claude-opus-4-7",
 }
 
 # PATH for subprocesses launched by _cron (launchd env is minimal).
@@ -88,6 +98,27 @@ def log(msg: str) -> None:
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
     with LOG_FILE.open("a") as f:
         f.write(line)
+
+
+def list_pending_images() -> list[Path]:
+    if not IMAGES_PENDING.exists():
+        return []
+    return sorted(p for p in IMAGES_PENDING.iterdir()
+                  if p.is_file() and p.suffix.lower() in IMAGE_EXTS)
+
+
+def pick_image() -> Path | None:
+    candidates = list_pending_images()
+    return random.choice(candidates) if candidates else None
+
+
+def archive_image(img: Path) -> Path:
+    """Move a used image to images/used/ with a timestamp prefix."""
+    IMAGES_USED.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+    dest = IMAGES_USED / f"{stamp}_{img.name}"
+    img.rename(dest)
+    return dest
 
 
 def check_dependencies() -> tuple[bool, list[str]]:
@@ -162,6 +193,12 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     save_json(CONFIG_FILE, cfg)
     print(f"\nWrote {CONFIG_FILE}")
+
+    # Create the image staging directories so they're discoverable.
+    IMAGES_PENDING.mkdir(parents=True, exist_ok=True)
+    IMAGES_USED.mkdir(parents=True, exist_ok=True)
+    (IMAGES_PENDING / ".gitkeep").touch()
+    print(f"Image staging: drop files into {IMAGES_PENDING}/ to enable image posts.")
 
     # symlink binary onto PATH
     BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
@@ -291,8 +328,9 @@ def cmd_status(args: argparse.Namespace) -> None:
         "ready":    "ready",
     }[prompt_state]
     print(f"  prompt:     {prompt_label}")
+    print(f"  images:     {len(list_pending_images())} pending in {IMAGES_PENDING}")
     print(f"  config:     baseline_hour={cfg['baseline_hour']}, jitter≤{cfg['jitter_max_secs']//3600}h, "
-          f"min_gap={cfg['min_hours_between_runs']}h, mode={cfg['permission_mode']}")
+          f"min_gap={cfg['min_hours_between_runs']}h, mode={cfg['permission_mode']}, model={cfg['claude_model']}")
 
     if not deps_ok:
         print("\n  dependency problems:")
@@ -428,12 +466,23 @@ def _print_dry_plan() -> None:
     print(f"PATH (cron):   {CRON_PATH}")
     print(f"prompt file:   {PROMPT_FILE} ({pstate})")
     print(f"prompt size:   {PROMPT_FILE.stat().st_size if PROMPT_FILE.exists() else 0} bytes")
+
+    prompt_text_preview = PROMPT_FILE.read_text() if PROMPT_FILE.exists() else ""
+    image_mode = IMAGE_PLACEHOLDER in prompt_text_preview
+    pending = list_pending_images()
+    if image_mode:
+        candidate = pending[0].name if pending else "<none — would skip>"
+        print(f"image mode:    on ({len(pending)} pending; e.g. {candidate})")
+    else:
+        print(f"image mode:    off (prompt has no {IMAGE_PLACEHOLDER})")
+    print(f"model:         {cfg['claude_model']}")
     print(f"perm mode:     {cfg['permission_mode']}")
     print(f"timeout:       30 min")
     print()
 
     print("command:")
-    print(f"  {claude_path} -p \"$(cat {PROMPT_FILE})\" --permission-mode {cfg['permission_mode']}")
+    print(f"  {claude_path} -p \"$(cat {PROMPT_FILE})\" "
+          f"--permission-mode {cfg['permission_mode']} --model {cfg['claude_model']}")
     print()
 
     if deps_problems:
@@ -502,6 +551,22 @@ def cmd_logs(args: argparse.Namespace) -> None:
         os.execvp("tail", ["tail", "-n", str(args.lines), str(LOG_FILE)])
 
 
+def cmd_images(args: argparse.Namespace) -> None:
+    pending = list_pending_images()
+    used = sorted(IMAGES_USED.iterdir()) if IMAGES_USED.exists() else []
+
+    print(f"pending ({IMAGES_PENDING}): {len(pending)} file(s)")
+    for p in pending:
+        size = p.stat().st_size
+        print(f"  {p.name} ({size:,} bytes)")
+    print(f"\nused ({IMAGES_USED}): {len(used)} file(s)")
+    for p in used[-10:]:
+        print(f"  {p.name}")
+    if len(used) > 10:
+        print(f"  … {len(used) - 10} older")
+    print(f"\nDrop new images into {IMAGES_PENDING}/ — supported: {', '.join(sorted(IMAGE_EXTS))}")
+
+
 def cmd_uninstall(args: argparse.Namespace) -> None:
     if launchctl_loaded():
         subprocess.run(["launchctl", "unload", str(PLIST_DEST)], capture_output=True)
@@ -553,6 +618,16 @@ def _do_claude_run(force: bool) -> None:
         log("skipping run (run `lipost-bot status` for details)")
         return
 
+    prompt_text = PROMPT_FILE.read_text()
+    selected_image: Path | None = None
+    if IMAGE_PLACEHOLDER in prompt_text:
+        selected_image = pick_image()
+        if selected_image is None:
+            log(f"prompt requires {IMAGE_PLACEHOLDER} but {IMAGES_PENDING} is empty — skipping run")
+            return
+        prompt_text = prompt_text.replace(IMAGE_PLACEHOLDER, str(selected_image.resolve()))
+        log(f"selected image: {selected_image.name}")
+
     if not force:
         jitter = random.randint(0, cfg["jitter_max_secs"])
         log(f"fired; sleeping {jitter}s (~{jitter//3600}h {jitter%3600//60}m)")
@@ -563,13 +638,14 @@ def _do_claude_run(force: bool) -> None:
     save_json(STATE_FILE, state)
 
     claude_path = shutil.which("claude", path=CRON_PATH) or "claude"
-    prompt_text = PROMPT_FILE.read_text()
-    log(f"starting claude ({claude_path})")
+    log(f"starting claude ({claude_path}, model={cfg['claude_model']})")
 
     env = {**os.environ, "PATH": CRON_PATH}
     try:
         proc = subprocess.run(
-            [claude_path, "-p", prompt_text, "--permission-mode", cfg["permission_mode"]],
+            [claude_path, "-p", prompt_text,
+             "--permission-mode", cfg["permission_mode"],
+             "--model", cfg["claude_model"]],
             cwd=str(REPO_DIR),
             env=env,
             capture_output=True,
@@ -591,17 +667,26 @@ def _do_claude_run(force: bool) -> None:
 
     log(f"claude exited rc={proc.returncode}")
 
-    # Parse URNs from output and append to posts.jsonl
+    # Parse URNs from output, record to posts.jsonl, archive image on first match.
+    archived_image: Path | None = None
     for m in URN_RE.finditer(proc.stdout or ""):
+        urn = m.group(1)
+        if selected_image is not None and archived_image is None and selected_image.exists():
+            archived_image = archive_image(selected_image)
+            log(f"archived image to {archived_image.relative_to(REPO_DIR)}")
         entry = {
-            "urn": m.group(1),
+            "urn": urn,
             "posted_at": now_iso(),
             "exit_code": proc.returncode,
+            "image": archived_image.name if archived_image else None,
         }
         POSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
         with POSTS_FILE.open("a") as f:
             f.write(json.dumps(entry) + "\n")
-        log(f"recorded post {entry['urn']}")
+        log(f"recorded post {urn}")
+
+    if selected_image is not None and archived_image is None:
+        log(f"no URN found in output — leaving {selected_image.name} in pending/")
 
 
 # ── arg parsing ────────────────────────────────────────────────────────────
@@ -641,6 +726,7 @@ def main() -> None:
     p_logs.add_argument("-n", "--lines", type=int, default=50)
     p_logs.set_defaults(func=cmd_logs)
 
+    sub.add_parser("images", help=f"list pending and used images under {IMAGES_DIR}").set_defaults(func=cmd_images)
     sub.add_parser("uninstall", help="remove launchd job + PATH symlink (keeps config + history)").set_defaults(func=cmd_uninstall)
 
     p_cron = sub.add_parser("_cron", help=argparse.SUPPRESS)
