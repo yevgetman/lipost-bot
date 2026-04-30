@@ -219,12 +219,18 @@ lipost-bot run
 lipost-bot posts --open     # see it on LinkedIn
 lipost delete <urn>         # if you want it gone
 
-# 9. Arm the schedule
+# 9. Arm the post schedule
 lipost-bot config active true
 lipost-bot status           # active: True
+
+# 10. (Optional, fully unattended) Arm the auto-generate cron too.
+#     Now drop images into images/pending/ at any time; drafts auto-create
+#     within 8h, you review whenever, approved drafts auto-publish on the
+#     next post-cron fire.
+lipost-bot config generate_active true
 ```
 
-After step 9, the launch agent fires daily at `baseline_hour`, sleeps the jitter, and pops the next approved draft. `lipost-bot status` is the one-stop check at any time.
+After step 9, the launch agent fires daily at `baseline_hour`, sleeps the jitter, and pops the next approved draft. After step 10, you no longer need to run `generate` manually — the cron drains `images/pending/` on its 8h interval. `lipost-bot status` is the one-stop check at any time.
 
 ---
 
@@ -272,7 +278,7 @@ lipost-bot posts --open        # open the most recent post on LinkedIn
 | Command | What it does |
 | --- | --- |
 | `init [--force]` | Interactive setup. `--force` skips the dependency preflight. |
-| `status` | Single-screen overview: active?, deps OK?, launchd loaded?, paused?, last run, next window, posts in last 7d, drafts queue, images pending, full config. |
+| `status` | Single-screen overview: active (post cron) + gen-active (generate cron), deps OK?, both launchd jobs loaded?, paused?, last run, next window, posts in last 7d, drafts queue, images pending, full config. |
 | `config` | Print all settings. |
 | `config <key>` | Print one key. |
 | `config <key> <value>` | Update one key (validated). Auto-reloads launchd if `baseline_hour` changes. |
