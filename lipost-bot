@@ -573,6 +573,13 @@ def cmd_logs(args: argparse.Namespace) -> None:
 
 
 def cmd_images(args: argparse.Namespace) -> None:
+    if args.open:
+        target = IMAGES_USED if args.used else IMAGES_PENDING
+        target.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(target)])
+        print(f"opened {target} in Finder")
+        return
+
     pending = list_pending_images()
     used = sorted(IMAGES_USED.iterdir()) if IMAGES_USED.exists() else []
 
@@ -586,6 +593,7 @@ def cmd_images(args: argparse.Namespace) -> None:
     if len(used) > 10:
         print(f"  … {len(used) - 10} older")
     print(f"\nDrop new images into {IMAGES_PENDING}/ — supported: {', '.join(sorted(IMAGE_EXTS))}")
+    print(f"Open in Finder: lipost-bot images --open  (add --used to open the archive)")
 
 
 def cmd_uninstall(args: argparse.Namespace) -> None:
@@ -751,7 +759,10 @@ def main() -> None:
     p_logs.add_argument("-n", "--lines", type=int, default=50)
     p_logs.set_defaults(func=cmd_logs)
 
-    sub.add_parser("images", help=f"list pending and used images under {IMAGES_DIR}").set_defaults(func=cmd_images)
+    p_images = sub.add_parser("images", help=f"list pending and used images under {IMAGES_DIR}")
+    p_images.add_argument("--open", action="store_true", help="open the pending dir in Finder (combine with --used to open the archive)")
+    p_images.add_argument("--used", action="store_true", help="with --open, open images/used/ instead")
+    p_images.set_defaults(func=cmd_images)
     sub.add_parser("uninstall", help="remove launchd job + PATH symlink (keeps config + history)").set_defaults(func=cmd_uninstall)
 
     p_cron = sub.add_parser("_cron", help=argparse.SUPPRESS)

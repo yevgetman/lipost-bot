@@ -256,6 +256,7 @@ lipost-bot logs -f             # tail what's happening
 | `posts [--limit N]` | List recorded URNs, newest first. |
 | `posts --open` | Open the most recent recorded post in your browser. |
 | `images` | List `images/pending/` and recent `images/used/` contents. |
+| `images --open` | Open `images/pending/` in Finder (so you can drag images in). Add `--used` to open the archive instead. |
 | `logs [-n N] [-f]` | Tail the log. `-f` follows. |
 | `uninstall` | Unload launchd, remove plist + PATH symlinks. **Keeps** `~/.config/lipost-bot/` (config + history). |
 
