@@ -20,3 +20,7 @@ drafts/
 # macOS Finder noise
 .DS_Store
 **/.DS_Store
+
+# python bytecode cache
+__pycache__/
+*.pyc

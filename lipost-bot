@@ -188,8 +188,44 @@ def create_draft(image_src: Path, caption: str, alt_text: str, model: str) -> st
         "alt_text": (alt_text or "").strip(),
         "image_filename": image_filename,
         "source_filename": image_src.name,
+        "source_url": None,
         "created_at": now_iso(),
         "approved_at": None,
+        "rejected_at": None,
+        "posted_at": None,
+        "urn": None,
+        "model": model,
+    }
+    (draft_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
+    return slug
+
+
+def create_text_draft(
+    caption: str,
+    *,
+    source_url: str | None = None,
+    model: str = "external",
+    status: str = "pending_approval",
+    approved_now: bool = False,
+) -> str:
+    """Create a text-only draft (no image). Used by external tools (e.g.
+    lipost-article) to enqueue article-derived posts. Returns slug."""
+    if status not in VALID_STATUSES:
+        raise ValueError(f"invalid status: {status}")
+    slug = make_slug()
+    draft_dir = DRAFTS_DIR / slug
+    draft_dir.mkdir(parents=True, exist_ok=False)
+
+    meta = {
+        "slug": slug,
+        "status": status,
+        "caption": caption.strip(),
+        "alt_text": "",
+        "image_filename": None,
+        "source_filename": None,
+        "source_url": source_url,
+        "created_at": now_iso(),
+        "approved_at": now_iso() if (status == "approved" or approved_now) else None,
         "rejected_at": None,
         "posted_at": None,
         "urn": None,
@@ -717,10 +753,14 @@ def _print_dry_plan() -> None:
         meta = next_draft["meta"]
         cap = (meta.get("caption") or "").replace("\n", " ")
         cap_preview = cap[:120] + ("…" if len(cap) > 120 else "")
-        print(f"next draft:    {next_draft['slug']}")
+        is_text_only = not meta.get("image_filename")
+        print(f"next draft:    {next_draft['slug']} ({'text-only' if is_text_only else 'image'})")
         print(f"  approved at: {meta.get('approved_at') or '?'}")
-        print(f"  image:       {next_draft['image_path']}")
-        print(f"  alt:         {meta.get('alt_text', '')}")
+        if is_text_only:
+            print(f"  source url:  {meta.get('source_url') or '(none)'}")
+        else:
+            print(f"  image:       {next_draft['image_path']}")
+            print(f"  alt:         {meta.get('alt_text', '')}")
         print(f"  caption:     {cap_preview}")
     print()
 
@@ -732,10 +772,13 @@ def _print_dry_plan() -> None:
 
     if next_draft is not None:
         meta = next_draft["meta"]
-        cmd_preview = f'{lipost_path} post --image "{next_draft["image_path"]}"'
-        if meta.get("alt_text"):
-            cmd_preview += f' --alt "{meta["alt_text"]}"'
-        cmd_preview += ' "<caption>"'
+        if not meta.get("image_filename"):
+            cmd_preview = f'{lipost_path} post -  (caption piped on stdin)'
+        else:
+            cmd_preview = f'{lipost_path} post --image "{next_draft["image_path"]}"'
+            if meta.get("alt_text"):
+                cmd_preview += f' --alt "{meta["alt_text"]}"'
+            cmd_preview += ' "<caption>"'
         print("command:")
         print(f"  {cmd_preview}")
         print()
@@ -1077,19 +1120,26 @@ def _review_one(draft: dict, i: int, total: int) -> str:
     while True:
         print("\033[2J\033[H", end="")  # clear screen, home cursor
         meta = draft["meta"]
-        print(f"━━━ draft {i}/{total} ━━━")
+        is_text_only = not meta.get("image_filename")
+        kind = "text-only" if is_text_only else "image"
+        print(f"━━━ draft {i}/{total} ({kind}) ━━━")
         print(f"slug:     {draft['slug']}")
         print(f"created:  {meta.get('created_at', '?')}")
-        print(f"source:   {meta.get('source_filename', '?')}  (model: {meta.get('model', '?')})")
-        print(f"image:    {draft['image_path']}")
+        if is_text_only:
+            src_url = meta.get("source_url")
+            print(f"source:   {src_url or '(none)'}  (model: {meta.get('model', '?')})")
+        else:
+            print(f"source:   {meta.get('source_filename', '?')}  (model: {meta.get('model', '?')})")
+            print(f"image:    {draft['image_path']}")
         print()
         print("caption:")
         for line in (meta.get("caption") or "").splitlines() or [""]:
             print(f"  {line}")
         print()
-        print("alt:")
-        print(f"  {meta.get('alt_text', '')}")
-        print()
+        if not is_text_only:
+            print("alt:")
+            print(f"  {meta.get('alt_text', '')}")
+            print()
 
         choice = input("[a]pprove  [r]eject  [e]dit  [g]enerate-again  [s]kip  [q]uit > ").strip().lower()
         if choice in ("a", "approve"):
@@ -1118,6 +1168,15 @@ def _review_one(draft: dict, i: int, total: int) -> str:
 
 def _regenerate_draft(draft: dict) -> None:
     """Ask Claude to rewrite this draft, optionally with user-supplied feedback."""
+    meta = draft["meta"]
+    if not meta.get("image_filename"):
+        print()
+        print("  ✗ regenerate is image-only at the moment. For text-only drafts,")
+        print("    re-run the source tool (e.g. `lipost-article <url>`) to produce")
+        print("    a fresh draft, or use [e]dit to revise this one in place.")
+        input("  [enter] to continue ")
+        return
+
     print()
     print("guidance for the rewrite (e.g. 'make it shorter' / 'less corporate' / 'lead with the failure mode')")
     print("press enter alone for no specific feedback (Claude will still see the previous draft).")
@@ -1128,7 +1187,6 @@ def _regenerate_draft(draft: dict) -> None:
         input("  [enter] to continue ")
         return
 
-    meta = draft["meta"]
     extra = (
         "PREVIOUS DRAFT FOR THIS IMAGE (revise; do NOT just repeat the same wording):\n"
         f"caption: {meta.get('caption', '(none)')}\n"
@@ -1212,6 +1270,41 @@ def _edit_draft_text(draft: dict) -> None:
     draft["meta"]["caption"] = new_cap
     draft["meta"]["alt_text"] = new_alt
     print("  ✓ updated")
+
+
+def cmd_draft_add(args: argparse.Namespace) -> None:
+    """External entry point: write a text-only draft into the queue.
+
+    Reads caption from --text VALUE, or from stdin if --text is "-" or omitted.
+    Used by sister tools (e.g. lipost-article) to enqueue article posts that
+    don't have an associated image. Prints the slug on stdout.
+    """
+    if args.text is None or args.text == "-":
+        if sys.stdin.isatty():
+            print("error: pass caption as --text VALUE or pipe via stdin (got neither)",
+                  file=sys.stderr)
+            sys.exit(1)
+        caption = sys.stdin.read()
+    else:
+        caption = args.text
+
+    caption = (caption or "").strip()
+    if not caption:
+        print("error: empty caption", file=sys.stderr)
+        sys.exit(1)
+
+    if args.status not in {"approved", "pending_approval"}:
+        print(f"error: --status must be 'approved' or 'pending_approval' (got {args.status!r})",
+              file=sys.stderr)
+        sys.exit(1)
+
+    slug = create_text_draft(
+        caption,
+        source_url=args.source,
+        model=args.model or "external",
+        status=args.status,
+    )
+    print(slug)
 
 
 def cmd_drafts(args: argparse.Namespace) -> None:
@@ -1405,20 +1498,30 @@ def _do_post_run(force: bool) -> None:
         log(f"draft {draft['slug']} is no longer approved (status={meta.get('status')}) — skipping")
         return
 
-    image_path = draft_dir / meta["image_filename"]
     caption = meta.get("caption") or ""
     alt = meta.get("alt_text") or ""
+    image_filename = meta.get("image_filename")
+    is_text_only = not image_filename
 
     lipost_path = shutil.which("lipost", path=CRON_PATH) or "lipost"
-    cmd = [lipost_path, "post", "--image", str(image_path)]
-    if alt:
-        cmd.extend(["--alt", alt])
-    cmd.append(caption)
+    if is_text_only:
+        cmd = [lipost_path, "post", "-"]
+        stdin_input: str | None = caption
+    else:
+        image_path = draft_dir / image_filename
+        cmd = [lipost_path, "post", "--image", str(image_path)]
+        if alt:
+            cmd.extend(["--alt", alt])
+        cmd.append(caption)
+        stdin_input = None
 
-    log(f"posting draft {draft['slug']} via lipost ({lipost_path})")
+    log(f"posting draft {draft['slug']} via lipost ({lipost_path}) [{'text' if is_text_only else 'image'}]")
     env = {**os.environ, "PATH": CRON_PATH}
     try:
-        proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5 * 60)
+        proc = subprocess.run(
+            cmd, env=env, input=stdin_input,
+            capture_output=True, text=True, timeout=5 * 60,
+        )
     except subprocess.TimeoutExpired as e:
         log(f"lipost timed out after 5m; partial output: {(e.stdout or '')[-500:]}")
         return
@@ -1513,6 +1616,14 @@ def main() -> None:
     p_images.add_argument("--skipped", action="store_true", help="with --open, open images/skipped/ instead")
     p_images.set_defaults(func=cmd_images)
     sub.add_parser("uninstall", help="remove launchd job + PATH symlink (keeps config + history)").set_defaults(func=cmd_uninstall)
+
+    p_draft_add = sub.add_parser("draft-add", help="enqueue a text-only draft (caption from --text or stdin); used by sister tools like lipost-article")
+    p_draft_add.add_argument("--text", default=None, help="caption text; pass '-' or omit to read from stdin")
+    p_draft_add.add_argument("--source", default=None, help="optional source URL recorded in meta.json (e.g. the article URL)")
+    p_draft_add.add_argument("--status", default="approved", choices=["approved", "pending_approval"],
+                             help="initial draft status (default: approved — skips review and goes straight into the cron queue)")
+    p_draft_add.add_argument("--model", default=None, help="optional model identifier recorded in meta.json")
+    p_draft_add.set_defaults(func=cmd_draft_add)
 
     p_cron = sub.add_parser("_cron", help=argparse.SUPPRESS)
     p_cron.set_defaults(func=cmd_cron)
