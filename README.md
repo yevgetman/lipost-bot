@@ -105,6 +105,18 @@ lipost-bot config claude_model claude-sonnet-4-6
 
 ---
 
+### The style layer
+
+Separately from `prompt.md`, the bot maintains a **formatting & punctuation layer** that's automatically appended to every prompt at generate time:
+
+- **`style.md`** — ships with the repo, app-controlled. Mechanical rules only: quotes, dashes, whitespace, character set, markdown handling, length caps, alt-text conventions. **Not** voice or content rules. View it with `lipost-bot style --baked`.
+- **`user_style.md`** — gitignored, optional. Your additions to the layer. `lipost-bot style` opens it in `$EDITOR` (creates it if missing).
+- `lipost-bot style --show` prints the combined layer (baked + user) exactly as injected.
+
+The split: voice/topic/tone live in `prompt.md`. Typography/whitespace/length live in the style layer. Updating `style.md` happens via `git pull` — your `user_style.md` survives.
+
+---
+
 ## Step 3 — Write the prompt
 
 The prompt is consumed only at **generate time**, not at fire time. It tells Claude how to read an image and what JSON to output.
@@ -244,6 +256,9 @@ lipost-bot posts               # post history (URN + caption ref)
 | `run --no-fire` | Print the resolved plan (queue counts, next draft, lipost path, deps, would-skip reasons) without calling lipost. |
 | `next` | Print the next scheduled window. |
 | `prompt` | Open `prompt.md` in `$EDITOR`. |
+| `style` | Open `user_style.md` in `$EDITOR` (creates if missing). Use this for your formatting/punctuation additions. |
+| `style --show` | Print the combined style layer (baked `style.md` + your `user_style.md`) exactly as it gets injected into the prompt. |
+| `style --baked` | Print only the baked-in `style.md` (read-only — edit via PR or `git pull` for updates). |
 | `posts [--limit N] [--open]` | Post history. `--open` opens the most recent URN in browser. |
 | `images [--open] [--skipped]` | List `images/pending/` (and `images/skipped/` if any). `--open` opens pending in Finder; `--skipped` opens the skipped dir. |
 | `logs [-n N] [-f]` | Tail `~/Library/Logs/lipost-bot.log`. `-f` follows. |
@@ -264,6 +279,8 @@ lipost-bot posts               # post history (URN + caption ref)
 | `~/code/lipost-bot/images/pending/` | Drop staged images here for `generate` to consume. |
 | `~/code/lipost-bot/images/skipped/` | Images Claude said SKIP on, with `<filename>.reason.txt` sidecars. |
 | `~/code/lipost-bot/drafts/<slug>/` | One directory per draft: `image.<ext>` + `meta.json` (status, caption, alt, timestamps, URN). |
+| `~/code/lipost-bot/style.md` | Baked-in formatting & punctuation layer (committed in repo, app-controlled). |
+| `~/code/lipost-bot/user_style.md` | Optional user additions to the style layer (gitignored). |
 | `~/code/lipost-bot/local.lipost-bot.plist` | Generated launch agent (gitignored). |
 | `~/.local/bin/lipost-bot` | Symlink to the CLI for `PATH`. |
 | `~/Library/LaunchAgents/local.lipost-bot.plist` | Symlink to the repo plist. |

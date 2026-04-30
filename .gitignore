@@ -4,6 +4,9 @@ local.lipost-bot.plist
 # user content; commit prompt.example.md instead
 prompt.md
 
+# user-specific additions to the style layer (style.md is committed)
+user_style.md
+
 # user image staging (created by `lipost-bot init`)
 images/
 

@@ -25,6 +25,14 @@ STATE_FILE = CONFIG_DIR / "state.json"
 POSTS_FILE = CONFIG_DIR / "posts.jsonl"
 LOG_FILE = HOME / "Library" / "Logs" / "lipost-bot.log"
 PROMPT_FILE = REPO_DIR / "prompt.md"
+
+# Style guide — formatting/punctuation rules, NOT voice or content rules.
+# style.md ships with the repo (app-controlled). user_style.md is gitignored
+# and lets a user append their own rules. Both are auto-appended to the
+# prompt at generate time, after the main prompt body.
+STYLE_FILE = REPO_DIR / "style.md"
+USER_STYLE_FILE = REPO_DIR / "user_style.md"
+
 LABEL = "local.lipost-bot"
 PLIST_SRC = REPO_DIR / f"{LABEL}.plist"
 PLIST_DEST = HOME / "Library" / "LaunchAgents" / f"{LABEL}.plist"
@@ -690,6 +698,36 @@ def cmd_prompt(args: argparse.Namespace) -> None:
     subprocess.call([editor, str(PROMPT_FILE)])
 
 
+def cmd_style(args: argparse.Namespace) -> None:
+    """View or edit the style layer (mechanical formatting rules)."""
+    if args.show:
+        layer = get_style_layer()
+        if not layer:
+            print("(no style layer — neither style.md nor user_style.md is present)")
+            return
+        print(layer.lstrip())
+        return
+
+    if args.baked:
+        if not STYLE_FILE.exists():
+            print(f"(no {STYLE_FILE.name} — the baked-in style layer is missing from the repo)")
+            return
+        print(STYLE_FILE.read_text().rstrip())
+        return
+
+    # Default: open user_style.md for editing (creates if missing).
+    USER_STYLE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not USER_STYLE_FILE.exists():
+        USER_STYLE_FILE.write_text(
+            "# Your additional formatting/punctuation rules\n\n"
+            "# These append to the baked-in style layer (style.md).\n"
+            "# Keep this focused on FORMATTING and PUNCTUATION, not voice or content —\n"
+            "# voice/content rules belong in prompt.md.\n"
+        )
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.call([editor, str(USER_STYLE_FILE)])
+
+
 def cmd_logs(args: argparse.Namespace) -> None:
     if not LOG_FILE.exists():
         print(f"no log file at {LOG_FILE}")
@@ -728,6 +766,28 @@ def cmd_images(args: argparse.Namespace) -> None:
 
 # ── generate / review / drafts ─────────────────────────────────────────────
 
+def get_style_layer() -> str:
+    """Return the combined style layer (baked + user) to append to prompts at
+    generate time. Empty string if neither file exists."""
+    parts: list[str] = []
+    if STYLE_FILE.exists():
+        baked = STYLE_FILE.read_text().strip()
+        if baked:
+            parts.append(baked)
+    if USER_STYLE_FILE.exists():
+        user = USER_STYLE_FILE.read_text().strip()
+        if user:
+            parts.append("# User additions\n\n" + user)
+    if not parts:
+        return ""
+    return (
+        "\n\n---\n"
+        "FORMATTING & PUNCTUATION LAYER (mechanical rules; apply on top of the voice rules above. "
+        "These describe HOW the text should look, not WHAT to say.):\n\n"
+        + "\n\n".join(parts)
+    )
+
+
 def _invoke_claude_on_image(image_path: Path, cfg: dict, extra_context: str = "") -> tuple[dict | None, str]:
     """Run Claude on the image with optional extra context appended to the prompt.
     Returns (parsed_json_or_None, status_message). The caller decides what to do
@@ -741,6 +801,7 @@ def _invoke_claude_on_image(image_path: Path, cfg: dict, extra_context: str = ""
         return None, f"prompt has no {IMAGE_PLACEHOLDER} placeholder"
 
     prompt_text = prompt_template.replace(IMAGE_PLACEHOLDER, str(image_path.resolve()))
+    prompt_text += get_style_layer()
     if extra_context:
         prompt_text += "\n\n" + extra_context
 
@@ -1209,6 +1270,11 @@ def main() -> None:
     p_run.set_defaults(func=cmd_run)
     sub.add_parser("next", help="print the next scheduled window").set_defaults(func=cmd_next)
     sub.add_parser("prompt", help=f"open {PROMPT_FILE.name} in $EDITOR").set_defaults(func=cmd_prompt)
+
+    p_style = sub.add_parser("style", help="view or edit the formatting/punctuation layer (style.md baked + user_style.md additions)")
+    p_style.add_argument("--show", action="store_true", help="print the combined style layer that gets injected into prompts")
+    p_style.add_argument("--baked", action="store_true", help="print only the baked-in style.md (read-only)")
+    p_style.set_defaults(func=cmd_style)
 
     p_posts = sub.add_parser("posts", help="list past posts")
     p_posts.add_argument("--limit", type=int, default=20)
