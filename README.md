@@ -1,5 +1,59 @@
 # lipost-bot
 
+> **⚠️ DEPRECATED — merged into [yevgetman/lipost](https://github.com/yevgetman/lipost).**
+>
+> This standalone tool is no longer maintained. All functionality is now part of the unified `lipost` suite under the `drafts` and `bot` subcommands.
+>
+> **Migration:**
+>
+> ```bash
+> # Install the unified suite
+> git clone https://github.com/yevgetman/lipost.git
+> cd lipost && ./install.sh
+>
+> # Migrate config + state + drafts + images + prompt
+> lipost bot init   # interactive; offers to move legacy paths
+> ```
+>
+> `lipost bot init` will:
+>
+> - Unload the old `local.lipost-bot.*` launchd jobs.
+> - Move `~/.config/lipost-bot/{config.json,state.json,posts.jsonl}` → `~/.config/lipost/{bot.json,state.json,posts.jsonl}`.
+> - Move `~/code/lipost-bot/{drafts,images,prompt.md,user_style.md}` → `~/.local/share/lipost/{drafts,images}` and `~/.config/lipost/{prompt.md,user_style.md}`.
+> - Install the new `local.lipost.{post,generate}` launchd jobs.
+>
+> **Command mapping:**
+>
+> | Old | New |
+> | --- | --- |
+> | `lipost-bot init` | `lipost bot init` |
+> | `lipost-bot status` | `lipost bot status` |
+> | `lipost-bot config <k> <v>` | `lipost bot config <k> <v>` |
+> | `lipost-bot pause / resume / start / stop` | `lipost bot pause / resume / start / stop` |
+> | `lipost-bot next` | `lipost bot next` |
+> | `lipost-bot logs` | `lipost bot logs` |
+> | `lipost-bot uninstall` | `lipost bot uninstall` |
+> | `lipost-bot generate` | `lipost drafts generate` |
+> | `lipost-bot review` | `lipost drafts review` |
+> | `lipost-bot drafts` | `lipost drafts` |
+> | `lipost-bot drafts --status approved` | `lipost drafts --status approved` |
+> | `lipost-bot run` | `lipost drafts run` |
+> | `lipost-bot run --no-fire` | `lipost drafts run --no-fire` |
+> | `lipost-bot draft-add ...` | `lipost drafts add ...` |
+> | `lipost-bot prompt` | `lipost prompt` |
+> | `lipost-bot style [--show] [--baked]` | `lipost style [--show] [--baked]` |
+> | `lipost-bot posts [--open]` | `lipost posts [--open]` |
+> | `lipost-bot images [--open] [--skipped]` | `lipost images [--open] [--skipped]` |
+> | `lipost-bot cheatsheet` | `lipost cheatsheet` |
+>
+> After migrating and verifying the new flow works, you can remove this repo.
+>
+> ---
+>
+> _The original README follows for historical reference._
+>
+> ---
+
 A tiny launchd-driven autonomous LinkedIn poster with a human-in-the-loop approval queue. You batch-generate captioned drafts from staged images, review them in a TUI, approve the ones you like — and the bot posts the approved queue, one per day, at a randomized human-ish time.
 
 - macOS only (uses `launchd`).
